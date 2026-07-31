@@ -1,0 +1,15 @@
+# --- build artifacts (regenerable, never committed) ---
+# Snack Record
+snack-record/build/
+
+# meetily
+meetily/**/node_modules/
+meetily/frontend/src-tauri/target/
+meetily/frontend/.next/
+meetily/frontend/dist/
+meetily/frontend/out/
+meetily/frontend/.turbo/
+meetily/frontend/src-tauri/binaries/   # prebuilt ffmpeg/whisper sidecars, downloaded at build
+
+# --- misc ---
+**/.DS_Store

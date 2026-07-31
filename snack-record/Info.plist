@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+	<string>Snack Record</string>
+    <key>CFBundleExecutable</key>
+	<string>Snack Record</string>
+    <key>CFBundleIdentifier</key>
+    <string>app.snackrecord.local</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon.icns</string>
+	<key>CFBundleName</key>
+	<string>Snack Record</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>3.5</string>
+    <key>CFBundleVersion</key>
+    <string>41</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <false/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+	<string>用于录音并在本机通过 Snack Record 转写文本。</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>用于录制微信、飞书、腾讯会议等应用播放的系统音频，不保存屏幕画面。</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>用于将转写文本保存到桌面。</string>
+</dict>
+</plist>

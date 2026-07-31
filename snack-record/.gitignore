@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.venv/
+build/
+*.app
+*.dmg
+*.p12
+*.cer
+Models/
+Recordings/
+recent-jobs.plist
+__pycache__/
+*.pyc
