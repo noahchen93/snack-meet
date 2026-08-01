@@ -12,6 +12,7 @@
 static NSString *const SnackRecordMeetingPromptKey = @"SnackRecordMeetingPrompt";
 static NSString *const SnackRecordOutputDirectoryKey = @"SnackRecordOutputDirectory";
 static NSString *const SnackRecordDailyFolderKey = @"SnackRecordDailyFolder";
+static NSString *const SnackRecordRecordOnWindowPresenceKey = @"SnackRecordRecordOnWindowPresence";
 static NSString *const SnackRecordDefaultMeetingPrompt = @"调用会议纪要 skill 帮我结构化总结下面这段会议转写，不超过 600 字。";
 static NSString *const SnackRecordHandoffMetadataType = @"cn.yaowutech.snack.record-handoff+json";
 static NSString *const SnackDesktopGitHubURL = @"https://github.com/yaowu-ai/snack-desktop";
@@ -1971,6 +1972,7 @@ static NSString *const TranscriptionModeStandard = @"standard";
 @property(nonatomic) BOOL enabled;
 @property(nonatomic) BOOL recordingActive;
 @property(nonatomic) BOOL fullAutomatic;
+@property(nonatomic) BOOL recordOnWindowPresence;
 @property(nonatomic) BOOL probeStarting;
 @property(nonatomic) BOOL probeMicTapInstalled;
 @property(nonatomic) BOOL probeStreamOutputInstalled;
@@ -1990,6 +1992,8 @@ static NSString *const TranscriptionModeStandard = @"standard";
 @property(nonatomic, strong) NSTextField *reminderTitleLabel;
 @property(nonatomic, strong) NSTextField *reminderBodyLabel;
 @property(nonatomic, strong) NSButton *startButton;
+@property(nonatomic) BOOL reminderIsStopPrompt;
+@property(nonatomic, copy) NSString *stopPromptedForBundle;
 @property(nonatomic, copy) void (^startRecordingHandler)(void);
 @property(nonatomic, copy) void (^stopRecordingHandler)(void);
 - (void)setMonitoringEnabled:(BOOL)enabled;
@@ -2103,12 +2107,20 @@ static NSString *const TranscriptionModeStandard = @"standard";
 
 - (void)updateReminderPanelText {
     BOOL chinese = [self isChineseInterface];
-    self.reminderTitleLabel.stringValue = chinese ? @"会议录音提醒" : @"Meeting recording reminder";
     NSString *applicationName = self.detectedApplicationName ?: (chinese ? @"会议应用" : @"meeting app");
-    self.reminderBodyLabel.stringValue = chinese
-        ? [NSString stringWithFormat:@"检测到 %@ 可能正在进行会议，是否开始录音？", applicationName]
-        : [NSString stringWithFormat:@"Audio activity suggests a meeting in %@. Start recording?", applicationName];
-    self.startButton.title = chinese ? @"开始录音" : @"Start recording";
+    if (self.reminderIsStopPrompt) {
+        self.reminderTitleLabel.stringValue = chinese ? @"检测到会议结束" : @"Meeting ended";
+        self.reminderBodyLabel.stringValue = chinese
+            ? @"是否停止录音？"
+            : @"Stop recording?";
+        self.startButton.title = chinese ? @"停止录音" : @"Stop";
+    } else {
+        self.reminderTitleLabel.stringValue = chinese ? @"会议录音提醒" : @"Meeting recording reminder";
+        self.reminderBodyLabel.stringValue = chinese
+            ? [NSString stringWithFormat:@"已检测到 %@ 开启，是否自动录音？", applicationName]
+            : [NSString stringWithFormat:@"%@ is open. Auto-record this meeting?", applicationName];
+        self.startButton.title = chinese ? @"自动录音" : @"Auto-record";
+    }
 }
 
 - (void)applyInterfaceLanguage:(NSString *)language {
@@ -2167,9 +2179,11 @@ static NSString *const TranscriptionModeStandard = @"standard";
     }
 
     if (self.recordingActive) {
-        if (self.fullAutomatic && self.recordedMeetingBundleIdentifier) {
+        if (self.recordedMeetingBundleIdentifier) {
             if (![runningBundleIdentifiers containsObject:self.recordedMeetingBundleIdentifier]) {
+                NSLog(@"Snack Record meeting app exited; stopping recording");
                 self.recordedMeetingBundleIdentifier = nil;
+                self.stopPromptedForBundle = nil;
                 if (self.stopRecordingHandler) self.stopRecordingHandler();
             } else if (!self.probeStarting) {
                 self.probeStarting = YES;
@@ -2192,10 +2206,14 @@ static NSString *const TranscriptionModeStandard = @"standard";
                                 break;
                             }
                         }
-                        if (!stillMeeting) {
-                            NSLog(@"Snack Record meeting window no longer visible; stopping recording");
-                            strongSelf.recordedMeetingBundleIdentifier = nil;
-                            if (strongSelf.stopRecordingHandler) strongSelf.stopRecordingHandler();
+                        if (stillMeeting) {
+                            // meeting window came back; allow a future stop prompt
+                            strongSelf.stopPromptedForBundle = nil;
+                        } else if (![strongSelf.stopPromptedForBundle isEqualToString:strongSelf.recordedMeetingBundleIdentifier]) {
+                            // meeting window gone but app still running — ask once
+                            NSLog(@"Snack Record meeting window no longer visible; asking to stop");
+                            strongSelf.stopPromptedForBundle = strongSelf.recordedMeetingBundleIdentifier;
+                            [strongSelf showStopReminder];
                         }
                     });
                 }];
@@ -2361,6 +2379,18 @@ static NSString *const TranscriptionModeStandard = @"standard";
     self.probeBundleIdentifier = selectedBundleIdentifier;
     self.detectedApplicationName = knownApplications[selectedBundleIdentifier];
     self.detectedWindowTitle = selectedWindow ? selectedWindow.title : @"";
+    self.recordedMeetingBundleIdentifier = selectedBundleIdentifier;
+
+    if (self.recordOnWindowPresence) {
+        // A meeting window is present. Skip the audio gate and ask the user to
+        // confirm — this fires even when the user is alone / mic muted / there
+        // is no system audio. The 8 s window re-probe stops the recording when
+        // the meeting window disappears.
+        NSLog(@"Snack Record window-presence trigger; asking to record (bundle=%@)", selectedBundleIdentifier);
+        [self showReminder];
+        return;
+    }
+
     [self startSystemAudioProbe];
 }
 
@@ -2551,6 +2581,25 @@ static NSString *const TranscriptionModeStandard = @"standard";
     if (!self.enabled || self.recordingActive || self.reminderPanel.isVisible) return;
     [self stopProbe];
     self.cooldownUntil = [NSDate dateWithTimeIntervalSinceNow:10 * 60];
+    self.reminderIsStopPrompt = NO;
+    self.startButton.action = @selector(startRecordingFromReminder:);
+    [self updateReminderPanelText];
+    NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
+    NSRect visibleFrame = screen.visibleFrame;
+    NSSize size = self.reminderPanel.frame.size;
+    [self.reminderPanel setFrameOrigin:NSMakePoint(NSMaxX(visibleFrame) - size.width - 20,
+                                                    NSMaxY(visibleFrame) - size.height - 20)];
+    [self.reminderPanel orderFrontRegardless];
+    [self.dismissTimer invalidate];
+    self.dismissTimer = [NSTimer scheduledTimerWithTimeInterval:15.0 target:self selector:@selector(dismissReminder:) userInfo:nil repeats:NO];
+}
+
+- (void)showStopReminder {
+    // The meeting window is gone but the app is still running — ask before
+    // stopping. Dismiss / timeout = keep recording; app-exit still auto-stops.
+    if (!self.enabled || !self.recordingActive || self.reminderPanel.isVisible) return;
+    self.reminderIsStopPrompt = YES;
+    self.startButton.action = @selector(stopRecordingFromReminder:);
     [self updateReminderPanelText];
     NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
     NSRect visibleFrame = screen.visibleFrame;
@@ -2575,7 +2624,15 @@ static NSString *const TranscriptionModeStandard = @"standard";
 - (void)startRecordingFromReminder:(id)sender {
     [self hideReminder];
     self.recordingActive = YES;
+    self.stopPromptedForBundle = nil;
     if (self.startRecordingHandler) self.startRecordingHandler();
+}
+
+- (void)stopRecordingFromReminder:(id)sender {
+    [self hideReminder];
+    self.recordedMeetingBundleIdentifier = nil;
+    self.stopPromptedForBundle = nil;
+    if (self.stopRecordingHandler) self.stopRecordingHandler();
 }
 
 @end
@@ -2658,6 +2715,7 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
         SnackRecordDailyFolderKey: @NO,
         @"SnackRecordMeetilyIntegration": @YES,
         @"SnackRecordMeetilyModel": @"large-v3-turbo-q5_0",
+        SnackRecordRecordOnWindowPresenceKey: @YES,
     }];
     if (![NSUserDefaults.standardUserDefaults boolForKey:@"SnackRecordChineseDefaultsApplied"]) {
         [NSUserDefaults.standardUserDefaults setObject:@"zh" forKey:@"SnackRecordInterfaceLanguage"];
@@ -2695,6 +2753,7 @@ static OSStatus HandleSnackRecordHotKey(EventHandlerCallRef nextHandler, EventRe
     [self updateStatusItemForState:TranscriptionStateReady];
     [self configureShortcut];
     self.meetingReminderMonitor.fullAutomatic = [self.recordingReminderMode isEqualToString:@"full"];
+    self.meetingReminderMonitor.recordOnWindowPresence = [NSUserDefaults.standardUserDefaults boolForKey:SnackRecordRecordOnWindowPresenceKey];
     [self.meetingReminderMonitor setMonitoringEnabled:[self.recordingReminderMode isEqualToString:@"automatic"] || [self.recordingReminderMode isEqualToString:@"full"]];
     [self.controller showWindow];
 }
@@ -3088,6 +3147,7 @@ shouldChangeTextInRange:(NSRange)affectedCharRange
     self.recordingReminderMode = [mode isEqualToString:@"automatic"] ? @"automatic" : ([mode isEqualToString:@"full"] ? @"full" : @"off");
     [NSUserDefaults.standardUserDefaults setObject:self.recordingReminderMode forKey:@"SnackRecordReminderMode"];
     self.meetingReminderMonitor.fullAutomatic = [self.recordingReminderMode isEqualToString:@"full"];
+    self.meetingReminderMonitor.recordOnWindowPresence = [NSUserDefaults.standardUserDefaults boolForKey:SnackRecordRecordOnWindowPresenceKey];
     [self.meetingReminderMonitor setMonitoringEnabled:[self.recordingReminderMode isEqualToString:@"automatic"] || [self.recordingReminderMode isEqualToString:@"full"]];
     [self updateLanguageMenus];
 }

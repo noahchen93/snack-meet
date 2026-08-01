@@ -279,8 +279,8 @@ impl SummaryService {
     }
 
     /// Renames the meeting folder on disk and updates `meetings.folder_path`
-    /// to `{sanitized_new_name}_{YYYY-MM-DD_HH-MM}`, preserving the folder's
-    /// original creation timestamp.
+    /// to `{sanitized_new_name}_{start--end}`, where the start/end span is the
+    /// actual recording time (from metadata.json), in local time.
     async fn rename_meeting_folder(
         pool: &SqlitePool,
         meeting_id: &str,
@@ -306,18 +306,72 @@ impl SummaryService {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let timestamp = old_name
-            .rsplit('_')
-            .next()
-            .filter(|s| s.len() == 16 && s.contains('-'))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| Utc::now().format("%Y-%m-%d_%H-%M").to_string());
+
+        // Recording start & end come from metadata.json, NOT the folder's own
+        // timestamp: meetily creates its meeting record at *import* time, so both
+        // the folder's trailing timestamp and `created_at` equal the import time —
+        // useless for "the meeting ran from-when to-when". metadata.json instead
+        // holds the recording start (meeting_name = "Snack Record-YYYYMMDD-HHMMSS",
+        // LOCAL time, written by Snack Record at recording start) and
+        // duration_seconds, so end = start + duration. Falls back to the folder's
+        // existing single timestamp when metadata is unavailable.
+        let (start_ts, end_ts): (String, String) =
+            (|| -> Option<(String, String)> {
+                let raw = std::fs::read_to_string(old_path.join("metadata.json")).ok()?;
+                let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+                let meeting_name = v.get("meeting_name")?.as_str()?;
+                let duration = v.get("duration_seconds")?.as_f64()?;
+                let name_no_ext = meeting_name.trim_end_matches(".txt");
+                let mut parts = name_no_ext.rsplitn(3, '-');
+                let time = parts.next()?;
+                let date = parts.next()?;
+                if date.len() != 8 || time.len() != 6 {
+                    return None;
+                }
+                let start = chrono::NaiveDateTime::parse_from_str(
+                    &format!("{}-{}", date, time),
+                    "%Y%m%d-%H%M%S",
+                )
+                .ok()?;
+                let dur = chrono::Duration::from_std(std::time::Duration::from_secs_f64(duration))
+                    .ok()?;
+                let end = start + dur;
+                let fmt = "%Y-%m-%d_%H-%M";
+                Some((start.format(fmt).to_string(), end.format(fmt).to_string()))
+            })()
+            .unwrap_or_else(|| {
+                let ts = old_name
+                    .rsplit('_')
+                    .next()
+                    .filter(|s| s.len() == 16 && s.contains('-'))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| Utc::now().format("%Y-%m-%d_%H-%M").to_string());
+                (ts.clone(), ts)
+            });
 
         let sanitized = crate::audio::audio_processing::sanitize_filename(new_name);
         if sanitized.is_empty() {
             return Ok(());
         }
-        let new_folder_name = format!("{}_{}", sanitized, timestamp);
+        // "<topic>_<start>--<end>". Same day -> date once, time range only.
+        let new_folder_name = if start_ts == end_ts {
+            format!("{}_{}", sanitized, start_ts)
+        } else {
+            let (start_date, start_time) = match start_ts.split_once('_') {
+                Some((d, t)) => (d, t),
+                None => (start_ts.as_str(), ""),
+            };
+            let (end_date, end_time) = match end_ts.split_once('_') {
+                Some((d, t)) => (d, t),
+                None => (end_ts.as_str(), ""),
+            };
+            let range = if start_date == end_date {
+                format!("{}_{}--{}", start_date, start_time, end_time)
+            } else {
+                format!("{}--{}", start_ts, end_ts)
+            };
+            format!("{}_{}", sanitized, range)
+        };
         if new_folder_name == old_name {
             return Ok(());
         }
