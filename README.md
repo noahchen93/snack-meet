@@ -26,7 +26,7 @@ There is **no longer a wav-file handoff and no second process**. One app detects
 
 ```zsh
 zsh build.sh        # builds meetily/frontend -> meetily/target/release/meetily
-zsh install.sh      # installs the single app -> /Applications/meetily.app
+zsh install.sh      # installs the single app -> /Applications/Snack Meet.app
 ```
 
 `build.sh` runs `pnpm tauri build --no-bundle` (the `--no-bundle` binary embeds the `_next` frontend; a plain `cargo build` does **not**, and yields a blank UI). The binary lands in the **workspace-root** target dir `meetily/target/release/` — not `src-tauri/target/`. Details and prerequisites (Node, pnpm, Rust, Xcode CLT, ffmpeg) are in **[docs/INTEGRATION.md](docs/INTEGRATION.md)**.
@@ -82,7 +82,7 @@ Working and verified on macOS (Apple Silicon):
 - Meeting-window detector (Rust port), native start/stop dialogs, auto-summarize on detect-triggered stop, smart rename. ✅ (builds; live-meeting confirmation pending a real call)
 - Single app — no Snack Record process, tray reads "Snack Meet". ✅
 
-The bundle identifier is kept as `com.meetily.ai` (not renamed) so existing DB/recordings/onboarding/TCC carry over; only the display name changed to "Snack Meet".
+The bundle identifier is kept as `com.meetily.ai` (not renamed) so existing DB/recordings/onboarding/TCC carry over. The `.app` is named and displayed as **"Snack Meet"** (`/Applications/Snack Meet.app`); the internal executable is still `meetily`, which is harmless.
 
 ## License & attribution
 
