@@ -12,6 +12,8 @@ export interface RecordingPreferences {
   file_format: string;
   preferred_mic_device: string | null;
   preferred_system_device: string | null;
+  /** Snack Meet: run the meeting-window auto-detector in the background. */
+  auto_detect_meetings: boolean;
 }
 
 interface RecordingSettingsProps {
@@ -24,7 +26,8 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     auto_save: true,
     file_format: 'mp4',
     preferred_mic_device: null,
-    preferred_system_device: null
+    preferred_system_device: null,
+    auto_detect_meetings: false
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -77,6 +80,39 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     await Analytics.track('auto_save_recording_toggled', {
       enabled: enabled.toString()
     });
+  };
+
+  // Snack Meet: toggle the meeting-window auto-detector. Persisting the pref also
+  // controls whether the detector auto-starts on next launch (lib.rs setup reads it).
+  // At runtime we start/stop the live detector immediately. Screen Recording TCC is
+  // required for SCShareableContent window enumeration, so request it on enable.
+  const handleAutoDetectMeetingsToggle = async (enabled: boolean) => {
+    const newPreferences = { ...preferences, auto_detect_meetings: enabled };
+    setPreferences(newPreferences);
+    try {
+      await savePreferences(newPreferences);
+      if (enabled) {
+        const granted = await invoke<boolean>('preflight_screen_capture').catch(() => false);
+        if (!granted) {
+          await invoke('request_screen_capture').catch(() => {});
+          toast.warning('需要屏幕录制权限', {
+            description: '请在 系统设置 → 隐私与安全 → 屏幕录制 中授权 Snack Meet，然后重启应用。',
+          });
+        }
+        await invoke('meeting_detector_start');
+        toast.success('已开启会议自动检测', {
+          description: '检测到会议应用开启时会自动提示录音。',
+        });
+      } else {
+        await invoke('meeting_detector_stop');
+        toast.success('已关闭会议自动检测');
+      }
+      await Analytics.track('auto_detect_meetings_toggled', { enabled: enabled.toString() });
+    } catch (e) {
+      // Revert on failure.
+      setPreferences(preferences);
+      toast.error('切换会议自动检测失败', { description: e instanceof Error ? e.message : String(e) });
+    }
   };
 
   const handleDeviceChange = async (devices: SelectedDevices) => {
@@ -224,6 +260,22 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
         <Switch
           checked={showRecordingNotification}
           onCheckedChange={handleNotificationToggle}
+        />
+      </div>
+
+      {/* Snack Meet — Meeting Auto-Detection Toggle */}
+      <div className="flex items-center justify-between p-4 border rounded-lg">
+        <div className="flex-1">
+          <div className="font-medium">Auto-detect Meetings</div>
+          <div className="text-sm text-gray-600">
+            Automatically detect when a meeting app (腾讯会议 / Zoom / 飞书 / browser
+            meetings) opens and prompt to record. Requires Screen Recording permission.
+          </div>
+        </div>
+        <Switch
+          checked={preferences.auto_detect_meetings}
+          onCheckedChange={handleAutoDetectMeetingsToggle}
+          disabled={saving}
         />
       </div>
 

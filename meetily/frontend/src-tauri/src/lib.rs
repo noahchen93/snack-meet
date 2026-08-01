@@ -42,6 +42,7 @@ pub mod config;
 pub mod console_utils;
 pub mod database;
 pub mod external_trigger;
+pub mod meeting_detector;
 pub mod notifications;
 pub mod ollama;
 pub mod onboarding;
@@ -522,6 +523,23 @@ pub fn run() {
                 });
             }
 
+            // Meeting-window auto-detector (fused Snack Record detection). Manage shared
+            // state, and start the poll loop if the user has enabled it in preferences.
+            _app.manage(std::sync::Arc::new(tauri::async_runtime::Mutex::new(
+                meeting_detector::MeetingDetector::default(),
+            )) as meeting_detector::DetectorState);
+            let detector_app = _app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let prefs = audio::recording_preferences::load_recording_preferences(&detector_app)
+                    .await
+                    .unwrap_or_default();
+                if prefs.auto_detect_meetings {
+                    if let Err(e) = meeting_detector::start_detector(&detector_app).await {
+                        log::error!("Failed to start meeting detector on launch: {}", e);
+                    }
+                }
+            });
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -761,6 +779,14 @@ pub fn run() {
             audio::import::start_import_audio_command,
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
+            // Meeting-window auto-detector (fused Snack Record detection)
+            external_trigger::auto_summarize_meeting_command,
+            meeting_detector::meeting_detector_start,
+            meeting_detector::meeting_detector_stop,
+            meeting_detector::meeting_detector_set_recording_active,
+            meeting_detector::meeting_detector_is_enabled,
+            meeting_detector::preflight_screen_capture,
+            meeting_detector::request_screen_capture,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

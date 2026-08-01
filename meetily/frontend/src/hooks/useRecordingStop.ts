@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -263,6 +264,18 @@ export function useRecordingStop(
           if (!meetingId) {
             console.error('No meeting_id in response:', responseData);
             throw new Error('No meeting ID received from save operation');
+          }
+
+          // Snack Meet: if this recording was auto-triggered by the meeting-window
+          // detector, kick off background summary + smart folder rename. This mirrors
+          // the --import path (which auto-summarizes); the normal manual-stop path does
+          // not. The flag is set by MeetingDetectorProvider when the user confirms the
+          // auto-record dialog. auto_summarize_meeting_command runs fully headless and
+          // ends by calling rename_meeting_folder → "<topic>_<start>--<end>".
+          if (sessionStorage.getItem('snackmeet_auto_summarize') === '1') {
+            sessionStorage.removeItem('snackmeet_auto_summarize');
+            invoke('auto_summarize_meeting_command', { meetingId })
+              .catch((e) => console.warn('[Snack Meet] auto_summarize_meeting_command failed:', e));
           }
 
           let shouldDetectSummaryLanguage = false;

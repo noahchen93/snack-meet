@@ -23,6 +23,10 @@ pub struct RecordingPreferences {
     #[cfg(target_os = "macos")]
     #[serde(default)]
     pub system_audio_backend: Option<String>,
+    /// Whether the meeting-window auto-detector runs in the background and prompts to record
+    /// when a meeting app opens (the fused Snack Record detection feature).
+    #[serde(default)]
+    pub auto_detect_meetings: bool,
 }
 
 impl Default for RecordingPreferences {
@@ -35,6 +39,7 @@ impl Default for RecordingPreferences {
             preferred_system_device: None,
             #[cfg(target_os = "macos")]
             system_audio_backend: Some("coreaudio".to_string()),
+            auto_detect_meetings: false,
         }
     }
 }

@@ -1,19 +1,18 @@
 #!/bin/zsh
-# Snack Meet — unified build for both layers.
-#   1) Capture layer:  snack-record/build.sh        -> snack-record/build/Snack Record.app
-#   2) Intelligence:   pnpm tauri build --no-bundle  -> meetily/frontend/src-tauri/target/release/meetily
-#                      (the --no-bundle binary embeds the _next frontend; a plain `cargo build`
-#                       does NOT, and yields a blank UI — see docs/INTEGRATION.md)
+# Snack Meet — single-app build.
+#   pnpm tauri build --no-bundle  ->  meetily/target/release/meetily
+#   (the --no-bundle binary embeds the _next frontend; a plain `cargo build` does NOT,
+#    and yields a blank UI — see docs/INTEGRATION.md)
+#
+# The standalone snack-record/ capture app is RETIRED. Its meeting-window detection
+# logic is now ported into meetily's Rust backend (src-tauri/src/meeting_detector.rs)
+# and surfaced in the UI (src/contexts/MeetingDetectorProvider.tsx). The snack-record/
+# source is kept in the repo for reference/history only.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-
-# ---------- 1) Capture layer ----------
-echo "▸ Building capture layer (snack-record)…"
-( cd "$ROOT/snack-record" && zsh build.sh )
-
-# ---------- 2) Intelligence layer ----------
-echo "▸ Building intelligence layer (meetily)…"
 MEETILY="$ROOT/meetily/frontend"
+
+echo "▸ Building Snack Meet (meetily)…"
 if [[ ! -d "$MEETILY/node_modules" ]]; then
   echo "  installing frontend deps (pnpm install)…"
   ( cd "$MEETILY" && pnpm install --frozen-lockfile )
@@ -21,7 +20,9 @@ fi
 # --no-bundle: emit only the self-contained binary (embeds _next). Verified working.
 ( cd "$MEETILY" && pnpm tauri build --no-bundle )
 
-MEETILY_BIN="$MEETILY/src-tauri/target/release/meetily"
+# The binary lands in the WORKSPACE-ROOT target dir (meetily/target), NOT
+# meetily/frontend/src-tauri/target — the Cargo workspace root is meetily/.
+BIN="$ROOT/meetily/target/release/meetily"
 echo "✓ Done."
-echo "  Snack Record.app : $ROOT/snack-record/build/Snack Record.app"
-[[ -f "$MEETILY_BIN" ]] && echo "  meetily binary   : $MEETILY_BIN" || echo "  (meetily binary path may differ by target triple — check src-tauri/target/release/)"
+[[ -f "$BIN" ]] && echo "  Snack Meet binary: $BIN" \
+  || echo "  ✗ binary not found at $BIN (check meetily/target/release/)"

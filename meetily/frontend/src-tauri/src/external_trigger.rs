@@ -102,7 +102,7 @@ pub fn trigger_import_from_args<R: Runtime>(app: &AppHandle<R>, args: &[String])
 /// Auto-generate a summary for an externally imported meeting, so a smart title
 /// can be extracted and applied (folder + DB). Mirrors what the UI's
 /// `api_process_transcript` command does, but runs fully headless.
-async fn auto_summarize_meeting<R: Runtime>(app: AppHandle<R>, meeting_id: String) {
+pub async fn auto_summarize_meeting<R: Runtime>(app: AppHandle<R>, meeting_id: String) {
     trace(&format!("auto_summarize_meeting: meeting_id={}", meeting_id));
     let pool = app.state::<crate::state::AppState>().db_manager.pool().clone();
 
@@ -175,6 +175,18 @@ async fn auto_summarize_meeting<R: Runtime>(app: AppHandle<R>, meeting_id: Strin
         .await;
     });
     log_info!("Auto-summary background task spawned for meeting_id: {}", meeting_id);
+}
+
+/// Tauri command wrapper so the frontend can trigger background summarize + smart rename
+/// after a meeting-window-detector-triggered recording stops (the standalone recording path
+/// does not auto-summarize on its own; the import path does).
+#[tauri::command]
+pub async fn auto_summarize_meeting_command<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+) -> Result<(), String> {
+    auto_summarize_meeting(app, meeting_id).await;
+    Ok(())
 }
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
