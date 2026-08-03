@@ -9,8 +9,20 @@ const TRACE_FILE: &str = "/tmp/meetily-trigger.log";
 
 fn trace(msg: &str) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(TRACE_FILE) {
-        let _ = writeln!(f, "[{}] {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0), msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(TRACE_FILE)
+    {
+        let _ = writeln!(
+            f,
+            "[{}] {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            msg
+        );
     }
 }
 
@@ -28,7 +40,8 @@ pub fn trigger_import_from_args<R: Runtime>(app: &AppHandle<R>, args: &[String])
         return;
     };
 
-    let title = flag_value(args, TITLE_FLAG).unwrap_or_else(|| default_title_from_path(&source_path));
+    let title =
+        flag_value(args, TITLE_FLAG).unwrap_or_else(|| default_title_from_path(&source_path));
     let language = flag_value(args, LANGUAGE_FLAG);
     let model = flag_value(args, MODEL_FLAG);
     let provider = flag_value(args, PROVIDER_FLAG);
@@ -49,7 +62,10 @@ pub fn trigger_import_from_args<R: Runtime>(app: &AppHandle<R>, args: &[String])
 
     let app_handle = app.clone();
     let is_parakeet = provider.as_deref() == Some("parakeet");
-    trace(&format!("trigger_import_from_args: spawn task path={} model={:?} provider={:?}", source_path, model, provider));
+    trace(&format!(
+        "trigger_import_from_args: spawn task path={} model={:?} provider={:?}",
+        source_path, model, provider
+    ));
     tauri::async_runtime::spawn(async move {
         if !is_parakeet {
             let mut waited_ms = 0;
@@ -80,7 +96,10 @@ pub fn trigger_import_from_args<R: Runtime>(app: &AppHandle<R>, args: &[String])
         .await
         {
             Ok(result) => {
-                trace(&format!("import complete: meeting_id={} title={} segments={}", result.meeting_id, result.title, result.segments_count));
+                trace(&format!(
+                    "import complete: meeting_id={} title={} segments={}",
+                    result.meeting_id, result.title, result.segments_count
+                ));
                 log_info!(
                     "External import complete: meeting_id={} title={} segments={} duration={:.0}s",
                     result.meeting_id,
@@ -103,8 +122,15 @@ pub fn trigger_import_from_args<R: Runtime>(app: &AppHandle<R>, args: &[String])
 /// can be extracted and applied (folder + DB). Mirrors what the UI's
 /// `api_process_transcript` command does, but runs fully headless.
 pub async fn auto_summarize_meeting<R: Runtime>(app: AppHandle<R>, meeting_id: String) {
-    trace(&format!("auto_summarize_meeting: meeting_id={}", meeting_id));
-    let pool = app.state::<crate::state::AppState>().db_manager.pool().clone();
+    trace(&format!(
+        "auto_summarize_meeting: meeting_id={}",
+        meeting_id
+    ));
+    let pool = app
+        .state::<crate::state::AppState>()
+        .db_manager
+        .pool()
+        .clone();
 
     // Read the summary model config (provider + model) from the settings table.
     let Some(config) =
@@ -133,7 +159,10 @@ pub async fn auto_summarize_meeting<R: Runtime>(app: AppHandle<R>, meeting_id: S
     {
         Ok(rows) => rows,
         Err(e) => {
-            trace(&format!("auto_summarize_meeting: read transcripts failed: {}", e));
+            trace(&format!(
+                "auto_summarize_meeting: read transcripts failed: {}",
+                e
+            ));
             log_error!("Auto-summary skipped: failed to read transcripts: {}", e);
             return;
         }
@@ -143,11 +172,23 @@ pub async fn auto_summarize_meeting<R: Runtime>(app: AppHandle<R>, meeting_id: S
         trace("auto_summarize_meeting: empty transcript, skipping");
         return;
     }
-    trace(&format!("auto_summarize_meeting: transcript chars={}", text.chars().count()));
+    trace(&format!(
+        "auto_summarize_meeting: transcript chars={}",
+        text.chars().count()
+    ));
 
     // Create/reset the summary process entry, save chunk metadata, then spawn.
-    if let Err(e) = crate::database::repositories::summary::SummaryProcessesRepository::create_or_reset_process(&pool, &meeting_id).await {
-        trace(&format!("auto_summarize_meeting: create_or_reset_process failed: {}", e));
+    if let Err(e) =
+        crate::database::repositories::summary::SummaryProcessesRepository::create_or_reset_process(
+            &pool,
+            &meeting_id,
+        )
+        .await
+    {
+        trace(&format!(
+            "auto_summarize_meeting: create_or_reset_process failed: {}",
+            e
+        ));
         return;
     }
     if let Err(e) = crate::database::repositories::transcript_chunk::TranscriptChunksRepository::save_transcript_data(
@@ -160,7 +201,9 @@ pub async fn auto_summarize_meeting<R: Runtime>(app: AppHandle<R>, meeting_id: S
     let pool2 = pool.clone();
     let mid = meeting_id.clone();
     tauri::async_runtime::spawn(async move {
-        trace(&format!("auto_summarize_meeting: spawning process_transcript_background"));
+        trace(&format!(
+            "auto_summarize_meeting: spawning process_transcript_background"
+        ));
         crate::summary::service::SummaryService::process_transcript_background(
             app,
             pool2,
@@ -174,7 +217,10 @@ pub async fn auto_summarize_meeting<R: Runtime>(app: AppHandle<R>, meeting_id: S
         )
         .await;
     });
-    log_info!("Auto-summary background task spawned for meeting_id: {}", meeting_id);
+    log_info!(
+        "Auto-summary background task spawned for meeting_id: {}",
+        meeting_id
+    );
 }
 
 /// Tauri command wrapper so the frontend can trigger background summarize + smart rename

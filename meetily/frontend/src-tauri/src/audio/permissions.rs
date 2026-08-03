@@ -1,9 +1,66 @@
 // macOS audio permissions handling
 use anyhow::Result;
-use log::{info, warn, error};
+use log::{error, info, warn};
 
 #[cfg(target_os = "macos")]
 use std::process::Command;
+
+#[cfg(target_os = "macos")]
+fn microphone_authorization_status() -> std::result::Result<cidre::av::AuthorizationStatus, String>
+{
+    use cidre::av::{CaptureDevice, MediaType};
+
+    CaptureDevice::authorization_status_for_media_type(MediaType::audio())
+        .map_err(|e| format!("Failed to read microphone permission: {:?}", e))
+}
+
+#[cfg(target_os = "macos")]
+fn begin_microphone_permission_request(
+) -> std::result::Result<tokio::sync::oneshot::Receiver<bool>, String> {
+    use cidre::{
+        av::{CaptureDevice, MediaType},
+        blocks::SendBlock,
+    };
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut sender = Some(sender);
+    let mut completion = SendBlock::new1(move |granted| {
+        if let Some(sender) = sender.take() {
+            let _ = sender.send(granted);
+        }
+    });
+
+    CaptureDevice::request_access_for_media_type_ch(MediaType::audio(), &mut completion)
+        .map_err(|e| format!("Failed to request microphone permission: {:?}", e))?;
+
+    Ok(receiver)
+}
+
+/// Query macOS' real AVFoundation microphone authorization state and, when the
+/// user has not decided yet, display the native permission prompt.
+///
+/// Opening a CPAL input stream is not a reliable permission check: CoreAudio can
+/// successfully create the stream while delivering only zero samples. Using
+/// AVCaptureDevice keeps onboarding and recording from reporting that silent
+/// stream as an authorized microphone.
+#[cfg(target_os = "macos")]
+pub async fn ensure_microphone_permission() -> std::result::Result<bool, String> {
+    use cidre::av::AuthorizationStatus;
+
+    match microphone_authorization_status()? {
+        AuthorizationStatus::Authorized => Ok(true),
+        AuthorizationStatus::Denied | AuthorizationStatus::Restricted => Ok(false),
+        AuthorizationStatus::NotDetermined => begin_microphone_permission_request()?
+            .await
+            .map_err(|_| "Microphone permission request was cancelled".to_string()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub async fn ensure_microphone_permission() -> std::result::Result<bool, String> {
+    crate::audio::devices::trigger_audio_permission()
+        .map_err(|e| format!("Failed to trigger microphone permission: {}", e))
+}
 
 /// Check if the app has Audio Capture permission (required for Core Audio taps on macOS 14.4+)
 ///
@@ -85,8 +142,7 @@ pub async fn check_screen_recording_permission_command() -> bool {
 /// Tauri command to request Screen Recording permission
 #[tauri::command]
 pub async fn request_screen_recording_permission_command() -> Result<(), String> {
-    request_screen_recording_permission()
-        .map_err(|e| e.to_string())
+    request_screen_recording_permission().map_err(|e| e.to_string())
 }
 
 /// Trigger system audio permission request and verify it was granted
@@ -136,12 +192,10 @@ pub fn trigger_system_audio_permission() -> Result<bool> {
 #[tauri::command]
 pub async fn trigger_system_audio_permission_command() -> Result<bool, String> {
     // Run in blocking task to avoid blocking the async runtime
-    tokio::task::spawn_blocking(|| {
-        trigger_system_audio_permission()
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
-    .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(|| trigger_system_audio_permission())
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

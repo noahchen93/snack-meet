@@ -1,16 +1,14 @@
 //! Meeting-window auto-detection — a port of Snack Record's `MeetingReminderMonitor`
 //! (snack-record/Sources/main.m) into meetily's Rust backend.
 //!
-//! This module only *detects* meetings by enumerating on-screen windows via ScreenCaptureKit
-//! (`cidre::sc::ShareableContent`) and running apps via AppKit (`cidre::ns::Workspace`).
-//! It does NOT record audio — meetily's own capture pipeline does that. When a meeting
-//! window appears (or disappears), it emits Tauri events and lets the frontend drive
-//! `start_recording` / `stop_recording` + the auto-summarize flow.
+//! This module detects meetings by combining meeting-app window transitions with a scoped
+//! ScreenCaptureKit audio-activity probe. It does NOT persist probe audio — meetily's own
+//! capture pipeline handles recording. When a meeting starts (or ends), it emits Tauri
+//! events and lets the frontend drive `start_recording` / `stop_recording` and summarization.
 //!
 //! Key porting decisions vs the original Objective-C:
-//!   * The SCStream audio-gate probe is dropped. The original's `recordOnWindowPresence` path
-//!     already fires on window presence alone (so it triggers even when the user is alone /
-//!     mic-muted / there is no system audio) — that is the only path we keep.
+//!   * A candidate-window-scoped SCStream probe can confirm a meeting after sustained audio.
+//!     A delayed window-only fallback still supports silent, muted, and one-person meetings.
 //!   * `isOnScreen` is intentionally ignored for dedicated meeting apps (the 腾讯会议 fix):
 //!     SCShareableContent reports isOnScreen=0 mid-meeting for some apps. Home/launcher
 //!     windows are rejected by title + size instead.
@@ -22,16 +20,24 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cidre::{ns, sc};
+use cidre::{core_audio as ca, ns, sc};
 use serde::Serialize;
 use tauri::{async_runtime::Mutex, AppHandle, Emitter, Manager, Runtime, State};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(8);
+use crate::meeting_audio_probe::{self, AudioProbeHandle};
+
+const POLL_INTERVAL: Duration = Duration::from_secs(4);
 const START_COOLDOWN: Duration = Duration::from_secs(600); // 10 min after a start prompt
 const STOP_COOLDOWN: Duration = Duration::from_secs(120); // after a recording ends
+const CANDIDATE_STABLE_POLLS: u8 = 2;
+const MICROPHONE_TRIGGER_POLLS: u8 = 2;
+const AUDIO_TRIGGER_MS: u64 = 1_500;
+const SILENT_FALLBACK_POLLS: u8 = 6;
+const MICROPHONE_WHITELIST_PREFIXES: &[&str] = &["now.typeless"];
+const MICROPHONE_INFRASTRUCTURE_BUNDLES: &[&str] = &["com.apple.CoreSpeech"];
 
 /// Apps the detector watches, with their display names (main.m:2018).
 const MONITORED: &[(&str, &str)] = &[
@@ -53,7 +59,16 @@ const DEDICATED: &[&str] = &["us.zoom.xos", "com.tencent.meeting", "com.tencent.
 
 /// Title keywords that strongly indicate a meeting window (main.m:2289).
 const KEYWORDS: &[&str] = &[
-    "会议", "通话", "meeting", "call", "conference", "zoom", "teams", "meet", "钉钉", "webinar",
+    "会议",
+    "通话",
+    "meeting",
+    "call",
+    "conference",
+    "zoom",
+    "teams",
+    "meet",
+    "钉钉",
+    "webinar",
 ];
 
 /// Punctuation/whitespace stripped before comparing window titles to home-title candidates
@@ -65,6 +80,7 @@ pub struct MeetingDetected {
     pub bundle_id: String,
     pub app_name: String,
     pub window_title: String,
+    pub trigger: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -77,11 +93,49 @@ pub struct MeetingEnded {
 #[derive(Default)]
 pub struct MeetingDetector {
     pub enabled: bool,
+    /// Prevents startup detections from being emitted before the webview has
+    /// installed its `meeting-detected` listener (Tauri events are not queued).
+    pub ui_ready: bool,
     pub recording_active: bool,
     pub recorded_bundle: Option<String>,
     pub stop_prompted_for_bundle: Option<String>,
     pub cooldown_until: Option<Instant>,
+    candidate_signature: Option<String>,
+    candidate_stable_polls: u8,
+    microphone_active_polls: u8,
+    cooldown_signature: Option<String>,
+    audio_probe: Option<AudioProbeHandle>,
     cancel: Option<CancellationToken>,
+}
+
+#[derive(Clone, Debug)]
+struct WindowInfo {
+    id: u32,
+    bundle: String,
+    title: String,
+    width: f64,
+    height: f64,
+}
+
+struct DetectionCandidate {
+    signature: String,
+    bundle: String,
+    title: String,
+    window_id: Option<u32>,
+    microphone_trigger: bool,
+}
+
+impl WindowInfo {
+    fn signature(&self) -> String {
+        format!(
+            "{}:{}:{}:{:.0}x{:.0}",
+            self.bundle,
+            self.id,
+            self.title.trim().to_lowercase(),
+            self.width,
+            self.height
+        )
+    }
 }
 
 pub type DetectorState = Arc<Mutex<MeetingDetector>>;
@@ -100,6 +154,22 @@ fn app_name_for(bundle: &str) -> &'static str {
         .find(|(id, _)| *id == bundle)
         .map(|(_, name)| *name)
         .unwrap_or("会议应用")
+}
+
+fn display_name_for(bundle: &str) -> String {
+    let known = app_name_for(bundle);
+    if known != "会议应用" {
+        return known.to_string();
+    }
+    if bundle == "com.apple.CoreSpeech" {
+        return "系统语音输入".to_string();
+    }
+    ns::Workspace::shared()
+        .running_apps()
+        .iter()
+        .find(|app| app.bundle_id().is_some_and(|id| id.to_string() == bundle))
+        .and_then(|app| app.localized_name().map(|name| name.to_string()))
+        .unwrap_or_else(|| "麦克风应用".to_string())
 }
 
 fn normalize_title(s: &str) -> String {
@@ -122,6 +192,13 @@ fn home_titles_for(bundle: &str) -> &'static [&'static str] {
 fn is_home_title(title_lower: &str, bundle: &str) -> bool {
     let trimmed = title_lower.trim();
     if trimmed.is_empty() {
+        return false;
+    }
+    // Tencent Meeting uses the no-space Cocoa window title `TencentMeeting`
+    // for its real 1280x720 in-meeting window. Do not collapse it into the
+    // English launcher title `Tencent Meeting` during normalization.
+    if matches!(bundle, "com.tencent.meeting" | "com.tencent.wemeet") && trimmed == "tencentmeeting"
+    {
         return false;
     }
     let norm = normalize_title(trimmed);
@@ -155,13 +232,16 @@ fn window_suggests_meeting(bundle: &str, title: &str, width: f64, height: f64) -
 // cidre: enumerate windows / running apps
 // ---------------------------------------------------------------------------
 
-/// Returns `(bundle_id, title, width, height)` for every window in the current
-/// shareable content. Empty on permission error or fetch failure.
-async fn fetch_windows() -> Vec<(String, String, f64, f64)> {
+/// Returns every window in the current shareable content. Empty on permission
+/// error or fetch failure.
+async fn fetch_windows() -> Vec<WindowInfo> {
     let content = match sc::ShareableContent::current().await {
         Ok(c) => c,
         Err(e) => {
-            warn!("SCShareableContent fetch failed (screen-recording permission?): {}", e);
+            warn!(
+                "SCShareableContent fetch failed (screen-recording permission?): {}",
+                e
+            );
             return Vec::new();
         }
     };
@@ -174,7 +254,13 @@ async fn fetch_windows() -> Vec<(String, String, f64, f64)> {
             .owning_app()
             .map(|a| a.bundle_id().to_string())
             .unwrap_or_default();
-        out.push((bundle, title, size.width as f64, size.height as f64));
+        out.push(WindowInfo {
+            id: win.id(),
+            bundle,
+            title,
+            width: size.width as f64,
+            height: size.height as f64,
+        });
     }
     out
 }
@@ -195,6 +281,32 @@ fn running_monitored_bundles() -> HashSet<String> {
     set
 }
 
+fn filter_active_input_bundles(active: Vec<String>) -> Vec<String> {
+    active
+        .into_iter()
+        .filter(|bundle| {
+            bundle != "com.meetily.ai"
+                && !MICROPHONE_WHITELIST_PREFIXES
+                    .iter()
+                    .any(|prefix| bundle.starts_with(prefix))
+                && !MICROPHONE_INFRASTRUCTURE_BUNDLES.contains(&bundle.as_str())
+        })
+        .collect()
+}
+
+/// Bundle IDs of real applications with active input IO. Typeless is the user
+/// whitelist; CoreSpeech is infrastructure rather than an attributable caller
+/// and must be ignored to prevent Snack Meet's transcription from self-triggering.
+fn active_non_whitelisted_input_bundles() -> Vec<String> {
+    let active = ca::Process::list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|process| process.is_running_input().unwrap_or(false))
+        .filter_map(|process| process.bundle_id().ok().map(|id| id.to_string()))
+        .collect();
+    filter_active_input_bundles(active)
+}
+
 // ---------------------------------------------------------------------------
 // Poll loop + state machine
 // ---------------------------------------------------------------------------
@@ -202,41 +314,61 @@ fn running_monitored_bundles() -> HashSet<String> {
 async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
     let state = app.state::<DetectorState>();
     // Snapshot the fields we need, then release the lock before any .await.
-    let (enabled, recording_active, recorded_bundle, cooldown) = {
+    let (enabled, ui_ready, recording_active, recorded_bundle, cooldown) = {
         let det = state.lock().await;
         (
             det.enabled,
+            det.ui_ready,
             det.recording_active,
             det.recorded_bundle.clone(),
             det.cooldown_until,
         )
     };
-    if !enabled {
+    if !enabled || !ui_ready {
         return;
     }
 
     let running = running_monitored_bundles();
 
     if recording_active {
-        let Some(rb) = recorded_bundle.as_ref() else { return };
-        if !running.contains(rb) {
+        let Some(rb) = recorded_bundle.as_ref() else {
+            return;
+        };
+        let monitored_recording = MONITORED.iter().any(|(bundle, _)| *bundle == rb);
+        let source_still_active = if monitored_recording {
+            running.contains(rb)
+        } else {
+            active_non_whitelisted_input_bundles().contains(rb)
+        };
+        if !source_still_active {
             // App exited → auto-stop (no dialog).
             let mut det = state.lock().await;
             det.recording_active = false;
             det.recorded_bundle = None;
             det.stop_prompted_for_bundle = None;
             det.cooldown_until = Some(Instant::now() + STOP_COOLDOWN);
-            info!("meeting app exited; emitting meeting-ended(app-exit) bundle={}", rb);
+            info!(
+                "meeting app exited; emitting meeting-ended(app-exit) bundle={}",
+                rb
+            );
             let _ = app.emit(
                 "meeting-ended",
-                MeetingEnded { reason: "app-exit".into(), bundle_id: Some(rb.clone()) },
+                MeetingEnded {
+                    reason: "app-exit".into(),
+                    bundle_id: Some(rb.clone()),
+                },
             );
             return;
         }
+        // For a non-meeting voice-input app, microphone release is the natural
+        // end signal; there is no meeting window to inspect.
+        if !monitored_recording {
+            return;
+        }
         let windows = fetch_windows().await;
-        let still_meeting = windows
-            .iter()
-            .any(|(b, t, w, h)| b == rb && window_suggests_meeting(b, t, *w, *h));
+        let still_meeting = windows.iter().any(|w| {
+            &w.bundle == rb && window_suggests_meeting(&w.bundle, &w.title, w.width, w.height)
+        });
         let mut det = state.lock().await;
         if still_meeting {
             // Window came back; allow a future stop prompt.
@@ -244,38 +376,169 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
         } else if det.stop_prompted_for_bundle.as_deref() != Some(rb.as_str()) {
             // Window gone but app still running → ask once.
             det.stop_prompted_for_bundle = Some(rb.clone());
-            info!("meeting window no longer visible; emitting meeting-ended(window-gone) bundle={}", rb);
+            info!(
+                "meeting window no longer visible; emitting meeting-ended(window-gone) bundle={}",
+                rb
+            );
             let _ = app.emit(
                 "meeting-ended",
-                MeetingEnded { reason: "window-gone".into(), bundle_id: Some(rb.clone()) },
+                MeetingEnded {
+                    reason: "window-gone".into(),
+                    bundle_id: Some(rb.clone()),
+                },
             );
         }
         return;
     }
 
-    // Idle detection.
-    if let Some(until) = cooldown {
-        if Instant::now() < until {
-            return;
+    // Microphone use is the primary global signal. Prefer a monitored meeting
+    // app when several processes are using input; otherwise use the first
+    // non-whitelisted input process (Typeless is excluded above).
+    let active_input_bundles = active_non_whitelisted_input_bundles();
+    let microphone_bundle = active_input_bundles
+        .iter()
+        .find(|bundle| running.contains(bundle.as_str()))
+        .or_else(|| active_input_bundles.first())
+        .cloned();
+
+    if running.is_empty() && microphone_bundle.is_none() {
+        let mut det = state.lock().await;
+        det.candidate_signature = None;
+        det.candidate_stable_polls = 0;
+        det.microphone_active_polls = 0;
+        if let Some(probe) = det.audio_probe.take() {
+            probe.cancel();
         }
-    }
-    if running.is_empty() {
         return;
     }
-    let windows = fetch_windows().await;
-    let found = windows
-        .iter()
-        .find(|(b, t, w, h)| running.contains(b) && window_suggests_meeting(b, t, *w, *h));
-    if let Some((b, t, _, _)) = found {
-        let app_name = app_name_for(b).to_string();
+    let windows = if running.is_empty() {
+        Vec::new()
+    } else {
+        fetch_windows().await
+    };
+    let meeting_window = windows.iter().find(|w| {
+        running.contains(&w.bundle)
+            && window_suggests_meeting(&w.bundle, &w.title, w.width, w.height)
+    });
+    let candidate = if let Some(bundle) = microphone_bundle {
+        let scoped_window = meeting_window.filter(|window| window.bundle == bundle);
+        DetectionCandidate {
+            signature: format!("microphone:{bundle}"),
+            title: scoped_window
+                .map(|window| window.title.clone())
+                .unwrap_or_default(),
+            window_id: scoped_window.map(|window| window.id),
+            bundle,
+            microphone_trigger: true,
+        }
+    } else if let Some(window) = meeting_window {
+        DetectionCandidate {
+            signature: window.signature(),
+            bundle: window.bundle.clone(),
+            title: window.title.clone(),
+            window_id: Some(window.id),
+            microphone_trigger: false,
+        }
+    } else {
         let mut det = state.lock().await;
-        det.cooldown_until = Some(Instant::now() + START_COOLDOWN);
-        info!("meeting detected; emitting meeting-detected bundle={} title={}", b, t);
-        let _ = app.emit(
-            "meeting-detected",
-            MeetingDetected { bundle_id: b.clone(), app_name, window_title: t.clone() },
-        );
+        det.candidate_signature = None;
+        det.candidate_stable_polls = 0;
+        det.microphone_active_polls = 0;
+        if let Some(probe) = det.audio_probe.take() {
+            probe.cancel();
+        }
+        return;
+    };
+
+    let signature = candidate.signature.clone();
+    let mut det = state.lock().await;
+    let candidate_changed = det.candidate_signature.as_deref() != Some(signature.as_str());
+    if !candidate_changed {
+        det.candidate_stable_polls = det.candidate_stable_polls.saturating_add(1);
+    } else {
+        if let Some(probe) = det.audio_probe.take() {
+            probe.cancel();
+        }
+        det.candidate_signature = Some(signature.clone());
+        det.candidate_stable_polls = 1;
+        det.microphone_active_polls = 0;
     }
+    det.microphone_active_polls = if candidate.microphone_trigger {
+        det.microphone_active_polls.saturating_add(1)
+    } else {
+        0
+    };
+
+    // Start a fresh, window-scoped audio probe for a new candidate. The callback
+    // only updates an in-memory RMS accumulator; it never stores audio samples.
+    if candidate_changed {
+        drop(det);
+        let Some(window_id) = candidate.window_id else {
+            return;
+        };
+        match meeting_audio_probe::start(window_id).await {
+            Ok(probe) => {
+                let mut det = state.lock().await;
+                if det.candidate_signature.as_deref() == Some(signature.as_str()) {
+                    det.audio_probe = Some(probe);
+                } else {
+                    probe.cancel();
+                }
+            }
+            Err(e) => warn!("meeting audio probe unavailable; using silent fallback: {e}"),
+        }
+        return;
+    }
+
+    let active_audio_ms = det
+        .audio_probe
+        .as_ref()
+        .map_or(0, AudioProbeHandle::active_ms);
+
+    let cooldown_blocks_candidate = cooldown.is_some_and(|until| Instant::now() < until)
+        && det
+            .cooldown_signature
+            .as_deref()
+            .map_or(true, |previous| previous == signature);
+    let audio_confirmed = active_audio_ms >= AUDIO_TRIGGER_MS;
+    let microphone_confirmed = det.microphone_active_polls >= MICROPHONE_TRIGGER_POLLS;
+    let silent_fallback = det.candidate_stable_polls >= SILENT_FALLBACK_POLLS;
+    if cooldown_blocks_candidate
+        || det.candidate_stable_polls < CANDIDATE_STABLE_POLLS
+        || (!microphone_confirmed && !audio_confirmed && !silent_fallback)
+    {
+        return;
+    }
+
+    det.cooldown_until = Some(Instant::now() + START_COOLDOWN);
+    det.cooldown_signature = Some(signature);
+    if let Some(probe) = det.audio_probe.take() {
+        probe.cancel();
+    }
+    drop(det);
+
+    let app_name = display_name_for(&candidate.bundle);
+    info!(
+        "meeting detected; emitting meeting-detected bundle={} title={} mic={} audio_ms={} fallback={}",
+        candidate.bundle,
+        candidate.title,
+        microphone_confirmed,
+        active_audio_ms,
+        !microphone_confirmed && !audio_confirmed
+    );
+    let _ = app.emit(
+        "meeting-detected",
+        MeetingDetected {
+            bundle_id: candidate.bundle,
+            app_name,
+            window_title: candidate.title,
+            trigger: if microphone_confirmed {
+                "microphone".to_string()
+            } else {
+                "meeting".to_string()
+            },
+        },
+    );
 }
 
 async fn poll_loop<R: Runtime>(app: AppHandle<R>, cancel: CancellationToken) {
@@ -297,6 +560,17 @@ async fn poll_loop<R: Runtime>(app: AppHandle<R>, cancel: CancellationToken) {
 // ---------------------------------------------------------------------------
 
 pub async fn start_detector<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    // Do not let the poll loop touch SCShareableContent before TCC has been granted.
+    // On macOS, an early enumeration can immediately recreate a denied TCC row after
+    // `tccutil reset`, preventing CGRequestScreenCaptureAccess from showing a fresh prompt.
+    if !preflight_screen_capture() {
+        warn!("meeting detector not started: Screen Recording permission is not granted");
+        return Err(
+            "Screen Recording permission is required before meeting detection can start"
+                .to_string(),
+        );
+    }
+
     let state = app.state::<DetectorState>();
     let mut det = state.lock().await;
     det.enabled = true;
@@ -319,6 +593,14 @@ pub async fn stop_detector<R: Runtime>(app: &AppHandle<R>) -> Result<(), String>
     det.recording_active = false;
     det.recorded_bundle = None;
     det.stop_prompted_for_bundle = None;
+    det.candidate_signature = None;
+    det.candidate_stable_polls = 0;
+    det.microphone_active_polls = 0;
+    det.cooldown_signature = None;
+    det.cooldown_until = None;
+    if let Some(probe) = det.audio_probe.take() {
+        probe.cancel();
+    }
     if let Some(c) = det.cancel.take() {
         c.cancel();
     }
@@ -356,13 +638,21 @@ pub async fn set_recording_active<R: Runtime>(
     let mut det = state.lock().await;
     det.recording_active = active;
     if active {
+        if let Some(probe) = det.audio_probe.take() {
+            probe.cancel();
+        }
         det.recorded_bundle = bundle_id;
         det.stop_prompted_for_bundle = None;
         det.cooldown_until = None;
+        det.cooldown_signature = None;
     } else {
         det.recorded_bundle = None;
         det.stop_prompted_for_bundle = None;
+        det.candidate_signature = None;
+        det.candidate_stable_polls = 0;
+        det.microphone_active_polls = 0;
         det.cooldown_until = Some(Instant::now() + STOP_COOLDOWN);
+        det.cooldown_signature = None;
     }
     Ok(())
 }
@@ -384,6 +674,28 @@ pub async fn meeting_detector_is_enabled<R: Runtime>(
     state: State<'_, DetectorState>,
 ) -> Result<bool, String> {
     Ok(state.lock().await.enabled)
+}
+
+/// Called by the frontend only after its event listeners are installed. Resetting
+/// the candidate and cooldown guarantees that a meeting already in progress is
+/// scanned again instead of losing the one-shot startup event.
+#[tauri::command]
+pub async fn meeting_detector_ui_ready<R: Runtime>(
+    _app: AppHandle<R>,
+    state: State<'_, DetectorState>,
+) -> Result<(), String> {
+    let mut det = state.lock().await;
+    det.ui_ready = true;
+    det.candidate_signature = None;
+    det.candidate_stable_polls = 0;
+    det.microphone_active_polls = 0;
+    det.cooldown_signature = None;
+    det.cooldown_until = None;
+    if let Some(probe) = det.audio_probe.take() {
+        probe.cancel();
+    }
+    info!("meeting detector frontend ready; forcing a fresh scan");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -417,28 +729,88 @@ mod tests {
 
     #[test]
     fn dedicated_meeting_window_by_size() {
-        assert!(window_suggests_meeting("com.tencent.meeting", "腾讯会议-张三的会议", 1280.0, 720.0));
+        assert!(window_suggests_meeting(
+            "com.tencent.meeting",
+            "腾讯会议-张三的会议",
+            1280.0,
+            720.0
+        ));
+        // Tencent's actual in-meeting Cocoa window title has no space. It must
+        // not be normalized into the English launcher title `Tencent Meeting`.
+        assert!(window_suggests_meeting(
+            "com.tencent.meeting",
+            "TencentMeeting",
+            1280.0,
+            720.0
+        ));
         // home title rejected even at meeting size
-        assert!(!window_suggests_meeting("com.tencent.meeting", "腾讯会议", 1280.0, 720.0));
+        assert!(!window_suggests_meeting(
+            "com.tencent.meeting",
+            "腾讯会议",
+            1280.0,
+            720.0
+        ));
+        assert!(!window_suggests_meeting(
+            "com.tencent.meeting",
+            "Tencent Meeting",
+            1280.0,
+            720.0
+        ));
         // too small
-        assert!(!window_suggests_meeting("com.tencent.meeting", "some window", 700.0, 400.0));
+        assert!(!window_suggests_meeting(
+            "com.tencent.meeting",
+            "some window",
+            700.0,
+            400.0
+        ));
     }
 
     #[test]
     fn keyword_match_in_browser() {
-        assert!(window_suggests_meeting("com.google.Chrome", "Weekly Standup - Google Meet", 800.0, 600.0));
+        assert!(window_suggests_meeting(
+            "com.google.Chrome",
+            "Weekly Standup - Google Meet",
+            800.0,
+            600.0
+        ));
     }
 
     #[test]
     fn feishu_never_size_branch() {
         // Feishu only triggers via keyword; size alone must not.
-        assert!(!window_suggests_meeting("com.electron.lark", "project chat", 1200.0, 800.0));
-        assert!(window_suggests_meeting("com.electron.lark", "飞书会议 评审", 1200.0, 800.0));
+        assert!(!window_suggests_meeting(
+            "com.electron.lark",
+            "project chat",
+            1200.0,
+            800.0
+        ));
+        assert!(window_suggests_meeting(
+            "com.electron.lark",
+            "飞书会议 评审",
+            1200.0,
+            800.0
+        ));
     }
 
     #[test]
     fn normalize_strips_punct() {
         assert_eq!(normalize_title("Zoom Meetings"), "zoommeetings");
         assert_eq!(normalize_title("腾讯会议 "), "腾讯会议");
+    }
+
+    #[test]
+    fn microphone_process_filter_excludes_whitelist_and_infrastructure() {
+        let filtered = filter_active_input_bundles(vec![
+            "now.typeless.desktop".into(),
+            "now.typeless.desktop.helper".into(),
+            "com.apple.CoreSpeech".into(),
+            "com.meetily.ai".into(),
+            "com.tencent.meeting".into(),
+            "com.example.voice-input".into(),
+        ]);
+        assert_eq!(
+            filtered,
+            vec!["com.tencent.meeting", "com.example.voice-input"]
+        );
     }
 }

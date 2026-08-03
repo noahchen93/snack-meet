@@ -12,6 +12,7 @@
     "app": {
         "windows": [
             {
+                "label": "main",
                 "title": "Snack Meet",
                 "width": 1100,
                 "height": 700,
@@ -19,6 +20,26 @@
                 "fullscreen": false,
                 "theme": "Light",
                 "decorations": true
+            },
+            {
+                "label": "recording-overlay",
+                "title": "Snack Meet Recording",
+                "url": "recording-overlay.html",
+                "width": 340,
+                "height": 92,
+                "minWidth": 340,
+                "minHeight": 92,
+                "maxWidth": 340,
+                "maxHeight": 92,
+                "resizable": false,
+                "fullscreen": false,
+                "decorations": false,
+                "transparent": true,
+                "alwaysOnTop": true,
+                "skipTaskbar": true,
+                "visible": false,
+                "focus": false,
+                "shadow": false
             }
         ],
         "macOSPrivateApi": true,
@@ -40,7 +61,8 @@
                     "identifier": "main",
                     "description": "Main window capability with file system and media access",
                     "windows": [
-                        "main"
+                        "main",
+                        "recording-overlay"
                     ],
                     "permissions": [
                         "fs:default",
@@ -60,9 +82,15 @@
                         "core:menu:default",
                         "core:tray:default",
                         "core:window:allow-set-title",
+                        "core:window:allow-show",
+                        "core:window:allow-hide",
+                        "core:window:allow-set-position",
+                        "core:window:allow-set-focus",
+                        "core:window:allow-unminimize",
                         "store:default",
                         "notification:default",
                         "notification:allow-is-permission-granted",
+                        "dialog:allow-confirm",
                         "updater:default",
                         "process:default",
                         {
