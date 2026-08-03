@@ -7,6 +7,8 @@ import { confirm } from '@tauri-apps/plugin-dialog';
 import { appDataDir } from '@tauri-apps/api/path';
 import { toast } from 'sonner';
 import { recordingService } from '@/services/recordingService';
+import { useTranscripts } from '@/contexts/TranscriptContext';
+import { meetingNameFromDetection } from '@/lib/smartMeetingName';
 
 /**
  * MeetingDetectorProvider
@@ -39,20 +41,12 @@ interface MeetingDetectedPayload {
   bundle_id: string;
   app_name: string;
   window_title: string;
+  trigger: 'microphone' | 'meeting';
 }
 
 interface MeetingEndedPayload {
   reason: string; // "app-exit" | "window-gone"
   bundle_id: string | null;
-}
-
-/** "Snack Meet-YYYYMMDD-HHMMSS.txt" — local-time timestamp that rename_meeting_folder
- *  parses (rsplitn(3,'-') → time, date) for the real meeting start. */
-function timestampedMeetingName(): string {
-  const d = new Date();
-  const p = (n: number) => String(n).padStart(2, '0');
-  const ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-  return `Snack Meet-${ts}.txt`;
 }
 
 async function buildSavePath(): Promise<string> {
@@ -104,6 +98,7 @@ export function MeetingDetectorProvider({ children }: { children: React.ReactNod
   // Guards against overlapping native dialogs (a start prompt + a stop prompt
   // landing within the same poll, or rapid repeated events).
   const dialogInProgress = useRef(false);
+  const { setMeetingTitle } = useTranscripts();
 
   useEffect(() => {
     let unlistenDetected: (() => void) | undefined;
@@ -111,25 +106,40 @@ export function MeetingDetectorProvider({ children }: { children: React.ReactNod
 
     const setup = async () => {
       unlistenDetected = await listen<MeetingDetectedPayload>('meeting-detected', async (event) => {
-        const { app_name, bundle_id } = event.payload;
+        const { app_name, bundle_id, window_title, trigger } = event.payload;
         if (dialogInProgress.current || (await isCurrentlyRecording())) return;
         dialogInProgress.current = true;
         try {
-          const ok = await confirm(`已检测到 ${app_name} 开启，是否自动录音？`, {
-            title: 'Snack Meet',
-            kind: 'warning',
-            okLabel: '开始录音',
-            cancelLabel: '取消',
-          });
-          if (!ok) return;
+          // Microphone use is the user's explicit primary trigger and starts
+          // immediately. Window/system-audio-only fallback still asks first.
+          if (trigger !== 'microphone') {
+            const ok = await confirm(`已检测到 ${app_name} 开启，是否自动录音？`, {
+              title: 'Snack Meet',
+              kind: 'warning',
+              okLabel: '开始录音',
+              cancelLabel: '取消',
+            });
+            if (!ok) return;
+          }
           if (await isCurrentlyRecording()) return; // user started manually meanwhile
-          // Flag → useRecordingStop auto-summarizes after save → smart folder rename.
-          sessionStorage.setItem('snackmeet_auto_summarize', '1');
-          const name = timestampedMeetingName();
+          // Only the explicitly confirmed meeting-window path may enter the
+          // existing AI summary flow. A microphone-triggered recording remains
+          // local and uses its source/date name unless the user summarizes later.
+          if (trigger === 'meeting') {
+            sessionStorage.setItem('snackmeet_auto_summarize', '1');
+          } else {
+            sessionStorage.removeItem('snackmeet_auto_summarize');
+          }
+          const name = meetingNameFromDetection(app_name, window_title);
+          setMeetingTitle(name);
           await recordingService.startRecordingWithDevices(null, null, name);
           // null mic/system → Rust uses the configured preferred devices.
           await invoke('meeting_detector_set_recording_active', { active: true, bundleId: bundle_id });
-          toast.success('已开始录音', { description: `${app_name} 会议` });
+          toast.success('已开始录音', {
+            description: trigger === 'microphone'
+              ? `${app_name} 正在使用麦克风`
+              : `${app_name} 会议`,
+          });
         } catch (e) {
           console.error('[Snack Meet] auto-record start failed:', e);
           sessionStorage.removeItem('snackmeet_auto_summarize');
@@ -164,15 +174,22 @@ export function MeetingDetectorProvider({ children }: { children: React.ReactNod
           dialogInProgress.current = false;
         }
       });
+
+      // Tauri events are not retained for listeners that have not mounted yet.
+      // Tell Rust it may emit only after both handlers above are active, and force
+      // a fresh scan for meetings that were already open when Snack Meet launched.
+      await invoke('meeting_detector_ui_ready');
     };
 
-    setup();
+    setup().catch((error) => {
+      console.error('[Snack Meet] Failed to initialize meeting detector UI bridge:', error);
+    });
 
     return () => {
       unlistenDetected?.();
       unlistenEnded?.();
     };
-  }, []);
+  }, [setMeetingTitle]);
 
   return <>{children}</>;
 }

@@ -92,12 +92,16 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     try {
       await savePreferences(newPreferences);
       if (enabled) {
-        const granted = await invoke<boolean>('preflight_screen_capture').catch(() => false);
+        const alreadyGranted = await invoke<boolean>('preflight_screen_capture').catch(() => false);
+        const granted = alreadyGranted
+          ? true
+          : await invoke<boolean>('request_screen_capture').catch(() => false);
         if (!granted) {
-          await invoke('request_screen_capture').catch(() => {});
           toast.warning('需要屏幕录制权限', {
-            description: '请在 系统设置 → 隐私与安全 → 屏幕录制 中授权 Snack Meet，然后重启应用。',
+            description: '自动检测设置已保存。请在 系统设置 → 隐私与安全 → 屏幕录制 中授权 Snack Meet，然后重启应用。',
           });
+          await Analytics.track('auto_detect_meetings_toggled', { enabled: 'true' });
+          return;
         }
         await invoke('meeting_detector_start');
         toast.success('已开启会议自动检测', {

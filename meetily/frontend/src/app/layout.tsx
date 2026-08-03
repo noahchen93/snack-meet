@@ -26,6 +26,9 @@ import { MeetingDetectorProvider } from '@/contexts/MeetingDetectorProvider'
 import { ImportAudioDialog, ImportDropOverlay } from '@/components/ImportAudio'
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
+import { RecordingOverlayController } from '@/components/RecordingOverlayController'
+import { RetranscriptionOverlayProvider } from '@/components/RetranscriptionOverlayProvider'
+import { usePathname } from 'next/navigation'
 
 
 const sourceSans3 = Source_Sans_3({
@@ -64,7 +67,24 @@ function ConditionalImportDialog({
 
 // export { metadata } from './metadata'
 
-export default function RootLayout({
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname()
+  const isRecordingOverlay = pathname.includes('recording-overlay')
+
+  if (isRecordingOverlay) {
+    return (
+      <html lang="zh-CN">
+        <body className={`${sourceSans3.variable} bg-transparent font-sans antialiased`}>
+          {children}
+        </body>
+      </html>
+    )
+  }
+
+  return <MainRootLayout>{children}</MainRootLayout>
+}
+
+function MainRootLayout({
   children,
 }: {
   children: React.ReactNode
@@ -245,6 +265,8 @@ export default function RootLayout({
                         <TooltipProvider>
                           <RecordingPostProcessingProvider>
                             <MeetingDetectorProvider>
+                            <RecordingOverlayController />
+                            <RetranscriptionOverlayProvider />
                             <ImportDialogProvider onOpen={handleOpenImportDialog}>
                               {/* Download progress toast provider - listens for background downloads */}
                               <DownloadProgressToastProvider />

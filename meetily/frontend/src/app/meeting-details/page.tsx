@@ -181,6 +181,19 @@ function MeetingDetailsContent() {
     };
   }, [meetingId, stopSummaryPolling]);
 
+  // Refresh transcripts when a background retranscription completes for the
+  // currently-viewed meeting (fires from RetranscriptionOverlayProvider).
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail?.meetingId && detail.meetingId === meetingId) {
+        refetch();
+      }
+    };
+    window.addEventListener('snackmeet:retranscription-complete', handler);
+    return () => window.removeEventListener('snackmeet:retranscription-complete', handler);
+  }, [meetingId, refetch]);
+
   useEffect(() => {
     console.log('MeetingDetails useEffect triggered - meetingId:', meetingId);
 

@@ -3,7 +3,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { appDataDir } from '@tauri-apps/api/path';
 import { useCallback, useEffect, useState, useRef } from 'react';
-import { Play, Pause, Square, Mic, AlertCircle, X } from 'lucide-react';
+import { Play, Pause, Square, Mic, AlertCircle, X, Sparkles } from 'lucide-react';
 import { ProcessRequest, SummaryResponse } from '@/types/summary';
 import { listen } from '@tauri-apps/api/event';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -26,6 +26,7 @@ interface RecordingControlsProps {
     systemDevice: string | null;
   };
   meetingName?: string;
+  onMeetingNameChange?: (name: string) => void;
 }
 
 export const RecordingControls: React.FC<RecordingControlsProps> = ({
@@ -40,6 +41,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   isParentProcessing,
   selectedDevices,
   meetingName,
+  onMeetingNameChange,
 }) => {
   // Use global recording state context for pause state (syncs with tray operations)
   const recordingState = useRecordingState();
@@ -341,8 +343,25 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
 
   return (
     <TooltipProvider>
-      <div className="flex flex-col space-y-2">
-        <div className="flex items-center space-x-2 bg-white rounded-full shadow-lg px-4 py-2">
+      <div className="flex flex-col items-center space-y-2">
+        {!isRecording && !isProcessing && onMeetingNameChange && (
+          <div className="flex w-[min(520px,calc(100vw-3rem))] items-center gap-2 rounded-2xl border border-slate-200/80 bg-white/95 px-4 py-2.5 shadow-lg shadow-slate-900/5 backdrop-blur-xl">
+            <Sparkles size={16} className="shrink-0 text-violet-500" />
+            <input
+              value={meetingName || ''}
+              onChange={(event) => {
+                onMeetingNameChange(event.target.value);
+                sessionStorage.removeItem('snackmeet_smart_name');
+              }}
+              maxLength={80}
+              aria-label="会议名称"
+              className="min-w-0 flex-1 bg-transparent text-sm font-medium text-slate-800 outline-none placeholder:text-slate-400"
+              placeholder="输入会议名称，或使用智能命名"
+            />
+            <span className="shrink-0 text-[11px] text-slate-400">录音文件名</span>
+          </div>
+        )}
+        <div className="flex items-center space-x-2 rounded-full border border-slate-200/70 bg-white/95 px-4 py-2 shadow-xl shadow-slate-900/10 backdrop-blur-xl">
           {isProcessing && !isParentProcessing ? (
             <div className="flex items-center space-x-2">
               <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-gray-900"></div>
