@@ -29,17 +29,23 @@ zsh build.sh        # builds meetily/frontend -> meetily/target/release/meetily
 zsh install.sh      # installs the single app -> /Applications/Snack Meet.app
 ```
 
-`build.sh` runs `pnpm tauri build --no-bundle` (the `--no-bundle` binary embeds the `_next` frontend; a plain `cargo build` does **not**, and yields a blank UI). The binary lands in the **workspace-root** target dir `meetily/target/release/` — not `src-tauri/target/`. Details and prerequisites (Node, pnpm, Rust, Xcode CLT, ffmpeg) are in **[docs/INTEGRATION.md](docs/INTEGRATION.md)**.
+`build.sh` runs `pnpm tauri build --no-bundle` (the `--no-bundle` binary embeds the `_next` frontend; a plain `cargo build` does **not**, and yields a blank UI). The binary lands in the **workspace-root** target dir `meetily/target/release/` — not `src-tauri/target/`. Details and prerequisites (Node, pnpm, Rust, full Xcode, ffmpeg) are in **[docs/INTEGRATION.md](docs/INTEGRATION.md)**.
 
 ### Permissions (TCC)
 
-After install, grant in System Settings → Privacy & Security, then **re-grant after every reinstall** (the local signature changes each build):
+After the first install, grant in System Settings → Privacy & Security:
 
-- **Screen Recording** → meetily — required for meeting-window detection (`SCShareableContent` enumerates on-screen windows).
-- **Microphone** → meetily.
-- **Audio Capture** → meetily — system audio via Core Audio process tap (macOS 14.4+).
+- **Screen Recording** → Snack Meet — required for meeting-window detection (`SCShareableContent` enumerates on-screen windows).
+- **Microphone** → Snack Meet.
+- **Audio Capture** → Snack Meet — system audio via Core Audio process tap (macOS 14.4+).
 
 Then open **Snack Meet → Settings → Recording** and turn on **Auto-detect Meetings**. (Screen Recording is requested on first enable.)
+
+`install.sh` creates and reuses a local **Snack Meet Local Code Signing** identity by
+default. This keeps the app's designated requirement stable, so the grants above survive
+future local rebuilds. The first migration from the old ad-hoc signature requires one clean
+re-grant. To intentionally use an ad-hoc signature instead, run
+`SNACK_MEET_SIGNING_IDENTITY=- zsh install.sh`.
 
 ## How detection works
 

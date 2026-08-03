@@ -45,12 +45,14 @@ contract and the filesystem (the wav, the meeting folder).
   running instance. Launch the binary directly — `Contents/MacOS/meetily --import`
   — so the single-instance socket forwards the args. This is why the capture
   layer uses `NSTask` on the binary, not `open`.
-- **Snack Record signing.** `build.sh` resolves a stable local signing identity
-  (`scripts/ensure_local_signing_identity.sh`). The signature changes each
-  rebuild, so **TCC permissions (Screen Recording, Microphone) must be re-granted
-  after every reinstall** — otherwise `SCStream` silently returns no audio.
-- **Prerequisites.** Xcode Command Line Tools, Node + pnpm (meetily frontend),
-  Rust toolchain, ffmpeg on PATH.
+- **Snack Meet signing.** `install.sh` resolves a stable local signing identity
+  (`scripts/ensure_local_signing_identity.sh`) and re-signs the complete app after
+  swapping its executable. The designated requirement therefore remains stable and
+  TCC permissions survive subsequent development rebuilds. Migrating once from the
+  previous ad-hoc signature still requires a clean re-grant.
+- **Prerequisites.** Full Xcode (the `cidre` build script runs `xcodebuild`),
+  Node + pnpm (meetily frontend), Rust toolchain, and ffmpeg on PATH. Command
+  Line Tools alone are not sufficient.
 
 ## The onscreen-reliability fix
 
@@ -104,5 +106,6 @@ observation unambiguously shows whether the in-meeting window was seen.
 - **Medium — misfire hardening.** Ensure only a real meeting window + sustained voice
   starts recording. System audio is global; a false window match + playing media could
   trigger. The 30 s non-frontmost threshold and home-title rejection mitigate this.
-- **Low — TCC prompt.** After every rebuild, remind the user to re-grant Screen
-  Recording + Microphone.
+- **Low — first stable-signature migration.** Re-grant Screen Recording,
+  Microphone, and Audio Capture once after moving from the old ad-hoc signature.
+  Subsequent installs signed by the managed local identity retain the grants.
