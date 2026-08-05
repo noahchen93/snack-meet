@@ -41,6 +41,7 @@ pub mod api;
 pub mod audio;
 pub mod config;
 pub mod console_utils;
+pub mod copilot;
 pub mod database;
 pub mod external_trigger;
 pub mod groq;
@@ -715,6 +716,12 @@ pub fn run() {
             summary::commands::api_save_meeting_detected_summary_language,
             summary::commands::api_detect_transcript_summary_language,
             summary::commands::api_cancel_summary,
+            // AI Copilot (experimental live meeting assistant)
+            copilot::copilot_ask,
+            copilot::copilot_save_context_document,
+            copilot::copilot_get_context_document,
+            copilot::copilot_get_cloud_config,
+            copilot::copilot_save_cloud_config,
             // Template commands
             summary::template_commands::api_list_templates,
             summary::template_commands::api_get_template_details,
