@@ -69,6 +69,11 @@ struct EnergyFrame {
 pub struct ChannelEnergyEstimator {
     frames: VecDeque<EnergyFrame>,
     next_start_ms: f64,
+    /// Last confidently-estimated speaker, used to smooth across short,
+    /// energy-ambiguous turns (a speaker usually talks continuously).
+    last_speaker: SpeakerLabel,
+    /// End time (ms) of the segment that produced `last_speaker`.
+    last_speaker_end_ms: f64,
 }
 
 impl ChannelEnergyEstimator {
@@ -76,7 +81,18 @@ impl ChannelEnergyEstimator {
         Self {
             frames: VecDeque::new(),
             next_start_ms: 0.0,
+            last_speaker: SpeakerLabel::Unknown,
+            last_speaker_end_ms: -1.0,
         }
+    }
+
+    /// Clear all history and the smoothed speaker state. Call at the start of a
+    /// new recording so segments never inherit a speaker from a previous session.
+    pub fn reset(&mut self) {
+        self.frames.clear();
+        self.next_start_ms = 0.0;
+        self.last_speaker = SpeakerLabel::Unknown;
+        self.last_speaker_end_ms = -1.0;
     }
 
     /// Add a mixed window's channel energies.
@@ -109,7 +125,38 @@ impl ChannelEnergyEstimator {
 
     /// Estimate the dominant speaker for a speech segment with the given time
     /// interval (in milliseconds from the start of the VAD session).
-    pub fn estimate(&self, start_ms: f64, end_ms: f64) -> SpeakerLabel {
+    ///
+    /// The estimate is smoothed over time: if the per-window energy is ambiguous
+    /// and the segment closely follows a confidently-labelled one, we inherit that
+    /// speaker rather than reporting `Unknown` (a person rarely alternates within
+    /// a few hundred milliseconds).
+    pub fn estimate(&mut self, start_ms: f64, end_ms: f64) -> SpeakerLabel {
+        let raw = self.estimate_raw(start_ms, end_ms);
+        let label = match raw {
+            SpeakerLabel::Local | SpeakerLabel::Remote => {
+                self.last_speaker = raw.clone();
+                self.last_speaker_end_ms = end_ms;
+                raw
+            }
+            SpeakerLabel::Unknown => {
+                // Inherit a recent confident label for a contiguous turn. The
+                // threshold is conservative: only bridge short, adjacent gaps so
+                // we do not glue two genuinely distinct speakers together.
+                let gap = start_ms - self.last_speaker_end_ms;
+                const MAX_BRIDGE_MS: f64 = 1500.0;
+                if self.last_speaker != SpeakerLabel::Unknown && gap >= 0.0 && gap <= MAX_BRIDGE_MS
+                {
+                    self.last_speaker.clone()
+                } else {
+                    SpeakerLabel::Unknown
+                }
+            }
+        };
+        label
+    }
+
+    /// Raw per-channel energy comparison, without temporal smoothing.
+    fn estimate_raw(&self, start_ms: f64, end_ms: f64) -> SpeakerLabel {
         if start_ms >= end_ms {
             return SpeakerLabel::Unknown;
         }
@@ -134,6 +181,19 @@ impl ChannelEnergyEstimator {
         }
 
         if total_weight <= 0.0 {
+            return SpeakerLabel::Unknown;
+        }
+
+        let weighted_mic: f64 = weighted_mic;
+        let weighted_sys: f64 = weighted_sys;
+
+        // If the whole segment is (near) silent in both channels — e.g. background
+        // noise or a false VAD trigger — there is no reliable speaker signal. Treat
+        // it as Unknown so it is not mislabeled Remote and does not pollute the
+        // temporal smoothing state.
+        const MIN_ENERGY: f64 = 1e-6; // mean-squared amplitude threshold over the segment
+        let avg_energy = (weighted_mic + weighted_sys) / total_weight;
+        if avg_energy < MIN_ENERGY {
             return SpeakerLabel::Unknown;
         }
 
@@ -175,7 +235,7 @@ mod tests {
 
     #[test]
     fn empty_estimator_returns_unknown() {
-        let estimator = ChannelEnergyEstimator::new();
+        let mut estimator = ChannelEnergyEstimator::new();
         assert_eq!(estimator.estimate(0.0, 600.0), SpeakerLabel::Unknown);
     }
 
@@ -211,6 +271,65 @@ mod tests {
         assert_eq!(estimator.estimate(600.0, 1200.0), SpeakerLabel::Remote);
         // Across both speakers is ambiguous (≈50/50) → Unknown
         assert_eq!(estimator.estimate(100.0, 1100.0), SpeakerLabel::Unknown);
+    }
+
+    #[test]
+    fn unknown_inherits_recent_speaker_within_bridge() {
+        let mut estimator = ChannelEnergyEstimator::new();
+        // 0-600 ms: confident local
+        estimator.add_window(600.0, &make_window(1.0, 9600), &make_window(0.1, 9600));
+        // 600-1200 ms: ambiguous (both quiet / equal) → would be Unknown
+        estimator.add_window(600.0, &make_window(0.3, 9600), &make_window(0.3, 9600));
+        // 1200-1800 ms: ambiguous
+        estimator.add_window(600.0, &make_window(0.3, 9600), &make_window(0.3, 9600));
+
+        assert_eq!(estimator.estimate(0.0, 600.0), SpeakerLabel::Local);
+        // Immediately follows Local, within bridge → stays Local instead of Unknown
+        assert_eq!(estimator.estimate(600.0, 1200.0), SpeakerLabel::Local);
+        assert_eq!(estimator.estimate(1200.0, 1800.0), SpeakerLabel::Local);
+    }
+
+    #[test]
+    fn unknown_does_not_inherit_across_long_gap() {
+        let mut estimator = ChannelEnergyEstimator::new();
+        // 0-600 ms: confident local
+        estimator.add_window(600.0, &make_window(1.0, 9600), &make_window(0.1, 9600));
+        // A long silent gap (no windows) then an ambiguous segment far later.
+        // We add filler windows that are silent in both channels to advance the
+        // timeline well beyond MAX_BRIDGE_MS.
+        for _ in 0..8 {
+            estimator.add_window(600.0, &make_window(0.0, 9600), &make_window(0.0, 9600));
+        }
+        estimator.add_window(600.0, &make_window(0.3, 9600), &make_window(0.3, 9600));
+
+        assert_eq!(estimator.estimate(0.0, 600.0), SpeakerLabel::Local);
+        // The ambiguous segment is ~4.8s later than the last confident label, so
+        // it must NOT inherit Local — it stays Unknown.
+        assert_eq!(estimator.estimate(4800.0, 5400.0), SpeakerLabel::Unknown);
+    }
+
+    #[test]
+    fn reset_clears_speaker_history() {
+        let mut estimator = ChannelEnergyEstimator::new();
+        estimator.add_window(600.0, &make_window(1.0, 9600), &make_window(0.1, 9600));
+        assert_eq!(estimator.estimate(0.0, 600.0), SpeakerLabel::Local);
+
+        estimator.reset();
+        // After reset, an ambiguous segment must NOT inherit the old Local.
+        estimator.add_window(600.0, &make_window(0.3, 9600), &make_window(0.3, 9600));
+        assert_eq!(estimator.estimate(0.0, 600.0), SpeakerLabel::Unknown);
+    }
+
+    #[test]
+    fn confident_segment_flips_speaker_despite_history() {
+        let mut estimator = ChannelEnergyEstimator::new();
+        // 0-600 ms: local
+        estimator.add_window(600.0, &make_window(1.0, 9600), &make_window(0.1, 9600));
+        // 600-1200 ms: clearly remote (confident) — must flip despite Local history
+        estimator.add_window(600.0, &make_window(0.1, 9600), &make_window(1.0, 9600));
+
+        assert_eq!(estimator.estimate(0.0, 600.0), SpeakerLabel::Local);
+        assert_eq!(estimator.estimate(600.0, 1200.0), SpeakerLabel::Remote);
     }
 
     #[test]

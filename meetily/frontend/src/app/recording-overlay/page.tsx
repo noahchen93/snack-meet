@@ -2,8 +2,10 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { emit } from '@tauri-apps/api/event';
+import { appDataDir } from '@tauri-apps/api/path';
 import { getCurrentWindow, Window } from '@tauri-apps/api/window';
-import { Mic2, Pause, Play, Radio, SquareArrowOutUpRight } from 'lucide-react';
+import { Mic2, Pause, Play, Radio, SquareArrowOutUpRight, Square } from 'lucide-react';
 import type { RecordingState } from '@/services/recordingService';
 
 function formatDuration(seconds: number | null): string {
@@ -55,6 +57,22 @@ export default function RecordingOverlayPage() {
     await sync();
   };
 
+  const stopRecording = async () => {
+    try {
+      const dataDir = await appDataDir();
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const savePath = `${dataDir}/recording-${timestamp}.wav`;
+      // Mirrors tray.stop_recording_handler + RecordingControls.stopRecordingAction:
+      // stop_recording emits `recording-stopped` (folder/meeting name) and resolves,
+      // then we broadcast `recording-stop-complete` which the main window's
+      // RecordingPostProcessingProvider listens for to run the full save flow.
+      await invoke('stop_recording', { args: { save_path: savePath } });
+      await emit('recording-stop-complete', true);
+    } catch (error) {
+      console.warn('[Recording overlay] Stop failed:', error);
+    }
+  };
+
   const openMainWindow = async () => {
     const main = await Window.getByLabel('main');
     await main?.show();
@@ -96,6 +114,16 @@ export default function RecordingOverlayPage() {
             aria-label={isPaused ? '继续录音' : '暂停录音'}
           >
             {isPaused ? <Play size={14} fill="currentColor" /> : <Pause size={14} fill="currentColor" />}
+          </button>
+        )}
+        {!ended && (
+          <button
+            onClick={stopRecording}
+            className="flex h-8 w-8 items-center justify-center rounded-full border border-rose-200 bg-rose-50 text-rose-600 transition hover:bg-rose-100"
+            aria-label="停止录音"
+            title="停止录音"
+          >
+            <Square size={12} fill="currentColor" />
           </button>
         )}
         <button
