@@ -17,6 +17,7 @@ interface SidebarItem {
 export interface CurrentMeeting {
   id: string;
   title: string;
+  createdAt?: string;
 }
 
 // Search result type for transcript search
@@ -86,10 +87,11 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
       try {
-        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string }>;
+        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, createdAt?: string }>;
         const transformedMeetings = meetings.map((meeting: any) => ({
           id: meeting.id,
-          title: meeting.title
+          title: meeting.title,
+          createdAt: meeting.createdAt
         }));
         setMeetings(transformedMeetings);
         Analytics.trackBackendConnection(true);
