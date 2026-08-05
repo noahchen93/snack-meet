@@ -55,6 +55,8 @@ re-grant. To intentionally use an ad-hoc signature instead, run
 - its title contains a meeting keyword (`会议 通话 meeting call conference zoom teams meet 钉钉 webinar`), or
 - it belongs to a **dedicated** meeting app (腾讯会议 / 腾讯会议 / Zoom) and is large enough (`≥800×500`), **ignoring `isOnScreen`** (SCShareableContent reports `isOnScreen=0` mid-meeting for some apps — the 腾讯会议 fix).
 
+In addition to meeting apps, **voice-calling apps (微信 / WhatsApp 语音)** are detected via sustained microphone use: the mic must be held for ~12 s, so hold-to-talk voice *messages* are ignored while live *calls* trigger a recording. There is no in-call window to watch, so these recordings stop automatically when the mic is released.
+
 It emits `meeting-detected` (then self-cools down 10 min) and, while recording, `meeting-ended{app-exit}` (auto-stop) or `meeting-ended{window-gone}` (ask before stopping). The frontend shows **native** confirmation dialogs (visible above a fullscreen meeting) and drives meetily's existing start/stop/save path. Detect-triggered recordings set a flag so the stop flow auto-summarizes (→ smart rename), mirroring the `--import` path.
 
 ## Repository layout

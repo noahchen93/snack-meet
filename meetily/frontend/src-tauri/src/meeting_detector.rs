@@ -38,6 +38,10 @@ const AUDIO_TRIGGER_MS: u64 = 1_000;
 const SILENT_FALLBACK_POLLS: u8 = 4;
 const MICROPHONE_WHITELIST_PREFIXES: &[&str] = &["now.typeless"];
 const MICROPHONE_INFRASTRUCTURE_BUNDLES: &[&str] = &["com.apple.CoreSpeech"];
+// Voice-messaging apps use the microphone both for live calls AND for short,
+// hold-to-talk voice messages. Requiring sustained mic use (~12 s) lets us detect
+// the former while ignoring the latter. Each poll is ~2 s apart.
+const VOICE_CALL_MIN_POLLS: u8 = 6;
 
 /// Apps the detector watches, with their display names (main.m:2018).
 const MONITORED: &[(&str, &str)] = &[
@@ -51,7 +55,19 @@ const MONITORED: &[(&str, &str)] = &[
     ("com.google.Chrome", "浏览器会议"),
     ("com.microsoft.edgemac", "浏览器会议"),
     ("org.mozilla.firefox", "浏览器会议"),
+    // Voice-calling apps: mic use alone also covers hold-to-talk voice messages,
+    // so they are gated on sustained mic usage (VOICE_CALL_MIN_POLLS), not just any
+    // mic grab. There is no dedicated in-call window to watch, so stop is signalled
+    // by mic release.
+    ("com.tencent.xinWeChat", "微信语音"),
+    ("net.whatsapp.WhatsApp", "WhatsApp 语音"),
 ];
+
+/// Apps that are watched via sustained microphone use rather than a meeting window.
+/// For these the detector does not look for a window or audio-probe the window; a
+/// call is confirmed only after the mic has been held for VOICE_CALL_MIN_POLLS, and
+/// the recording ends when the mic is released.
+const VOICE_CALL_APPS: &[&str] = &["com.tencent.xinWeChat", "net.whatsapp.WhatsApp"];
 
 /// Dedicated meeting apps whose in-meeting window is identified by size, ignoring isOnScreen
 /// (main.m:2044).
@@ -335,13 +351,19 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
             return;
         };
         let monitored_recording = MONITORED.iter().any(|(bundle, _)| *bundle == rb);
-        let source_still_active = if monitored_recording {
+        // Voice-calling apps have no dedicated in-call window; the call is "over"
+        // when the mic is released. WeChat/WhatsApp run continuously, so "running"
+        // alone cannot signal the end — we must watch mic use instead.
+        let is_voice_call = VOICE_CALL_APPS.contains(&rb.as_str());
+        let source_still_active = if is_voice_call {
+            active_non_whitelisted_input_bundles().contains(rb)
+        } else if monitored_recording {
             running.contains(rb)
         } else {
             active_non_whitelisted_input_bundles().contains(rb)
         };
         if !source_still_active {
-            // App exited → auto-stop (no dialog).
+            // App exited or call mic released → auto-stop (no dialog).
             let mut det = state.lock().await;
             det.recording_active = false;
             det.recorded_bundle = None;
@@ -358,6 +380,11 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
                     bundle_id: Some(rb.clone()),
                 },
             );
+            return;
+        }
+        // For voice-calling apps, mic release is the natural end signal; there is
+        // no meeting window to inspect.
+        if is_voice_call {
             return;
         }
         // For a non-meeting voice-input app, microphone release is the natural
@@ -501,7 +528,15 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
             .as_deref()
             .map_or(true, |previous| previous == signature);
     let audio_confirmed = active_audio_ms >= AUDIO_TRIGGER_MS;
-    let microphone_confirmed = det.microphone_active_polls >= MICROPHONE_TRIGGER_POLLS;
+    // Voice-calling apps (WeChat / WhatsApp) use the mic for brief hold-to-talk
+    // voice messages too, so require sustained mic use for them. Regular meeting
+    // apps confirm after just MICROPHONE_TRIGGER_POLLS.
+    let mic_threshold = if VOICE_CALL_APPS.contains(&candidate.bundle.as_str()) {
+        VOICE_CALL_MIN_POLLS
+    } else {
+        MICROPHONE_TRIGGER_POLLS
+    };
+    let microphone_confirmed = det.microphone_active_polls >= mic_threshold;
     let silent_fallback = det.candidate_stable_polls >= SILENT_FALLBACK_POLLS;
     if cooldown_blocks_candidate
         || det.candidate_stable_polls < CANDIDATE_STABLE_POLLS

@@ -272,8 +272,8 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
         <div className="flex-1">
           <div className="font-medium">Auto-detect Meetings</div>
           <div className="text-sm text-gray-600">
-            Automatically detect when a meeting app (腾讯会议 / Zoom / 飞书 / browser
-            meetings) opens and prompt to record. Requires Screen Recording permission.
+            自动检测会议/语音通话（腾讯会议 / Zoom / 飞书 / 浏览器会议 / 微信 / WhatsApp 语音），
+            检测到后提示录音。需要屏幕录制权限。
           </div>
         </div>
         <Switch
