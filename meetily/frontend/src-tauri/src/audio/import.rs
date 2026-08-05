@@ -739,8 +739,8 @@ async fn create_meeting_with_transcripts(
     // Insert transcripts
     for segment in segments {
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -749,6 +749,7 @@ async fn create_meeting_with_transcripts(
         .bind(segment.audio_start_time)
         .bind(segment.audio_end_time)
         .bind(segment.duration)
+        .bind(&segment.speaker)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
@@ -786,25 +787,20 @@ async fn get_or_init_whisper<R: Runtime>(
                 None => get_configured_model(app, "whisper").await?,
             };
 
-            let current_model = e.get_current_model().await;
-            let needs_load = match &current_model {
-                Some(loaded) => loaded != &target_model,
-                None => true,
-            };
+            // Use the concurrent loader so we don't evict another model that may be
+            // in use by a live recording or a parallel batch job.
+            if !e.is_model_loaded_named(&target_model).await {
+                info!("Loading Whisper model '{}' concurrently", target_model);
 
-            if needs_load {
-                info!(
-                    "Loading Whisper model '{}' (current: {:?})",
-                    target_model, current_model
-                );
-
-                if let Err(e) = e.discover_models().await {
-                    warn!("Model discovery error (continuing): {}", e);
+                if let Err(discover_err) = e.discover_models().await {
+                    warn!("Model discovery error (continuing): {}", discover_err);
                 }
 
-                e.load_model(&target_model)
+                e.load_model_concurrent(&target_model)
                     .await
                     .map_err(|e| anyhow!("Failed to load model '{}': {}", target_model, e))?;
+            } else {
+                info!("Whisper model '{}' already loaded concurrently", target_model);
             }
 
             Ok(e)
@@ -832,6 +828,7 @@ async fn get_or_init_parakeet<R: Runtime>(
                 None => get_configured_model(app, "parakeet").await?,
             };
 
+            // Parakeet still uses the single-model API; load if different from current.
             let current_model = e.get_current_model().await;
             let needs_load = match &current_model {
                 Some(loaded) => loaded != &target_model,
@@ -1253,6 +1250,7 @@ mod tests {
                 audio_start_time: Some(0.0),
                 audio_end_time: Some(1.5),
                 duration: Some(1.5),
+                speaker: None,
             },
             TranscriptSegment {
                 id: "t-2".to_string(),
@@ -1261,6 +1259,7 @@ mod tests {
                 audio_start_time: Some(2.0),
                 audio_end_time: Some(3.5),
                 duration: Some(1.5),
+                speaker: None,
             },
         ];
 

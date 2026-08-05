@@ -9,6 +9,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
 import { TranscriptSegmentData } from "@/types";
+import { User, Monitor } from "lucide-react";
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -38,6 +39,19 @@ export interface VirtualizedTranscriptViewProps {
 
 // Threshold for enabling virtualization (below this, use simple rendering)
 const VIRTUALIZATION_THRESHOLD = 10;
+
+// Helper to map backend speaker labels to a friendly badge
+function getSpeakerBadge(speaker: string | undefined): { icon: React.ReactNode; label: string; color: string } | null {
+    if (!speaker) return null;
+    switch (speaker) {
+        case 'local':
+            return { icon: <User className="w-3 h-3" />, label: '你', color: 'bg-blue-100 text-blue-700 border-blue-200' };
+        case 'remote':
+            return { icon: <Monitor className="w-3 h-3" />, label: '对方', color: 'bg-emerald-100 text-emerald-700 border-emerald-200' };
+        default:
+            return { icon: null, label: '未知', color: 'bg-gray-100 text-gray-600 border-gray-200' };
+    }
+}
 
 // Helper function to format seconds as recording-relative time [MM:SS]
 function formatRecordingTime(seconds: number | undefined): string {
@@ -71,6 +85,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence,
     isStreaming,
     showConfidence,
+    speaker,
 }: {
     id: string;
     timestamp: number;
@@ -78,6 +93,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence?: number;
     isStreaming: boolean;
     showConfidence: boolean;
+    speaker?: string;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
@@ -97,6 +113,12 @@ const TranscriptSegment = memo(function TranscriptSegment({
                     </TooltipContent>
                 </Tooltip>
                 <div className="flex-1">
+                    {getSpeakerBadge(speaker) && (
+                        <div className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs border mb-1 ${getSpeakerBadge(speaker)!.color}`}>
+                            {getSpeakerBadge(speaker)!.icon}
+                            <span>{getSpeakerBadge(speaker)!.label}</span>
+                        </div>
+                    )}
                     {isStreaming ? (
                         <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
@@ -296,6 +318,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speaker={segment.speaker}
                                     />
                                 </div>
                             );
@@ -352,6 +375,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speaker={segment.speaker}
                                     />
                                 </motion.div>
                             );

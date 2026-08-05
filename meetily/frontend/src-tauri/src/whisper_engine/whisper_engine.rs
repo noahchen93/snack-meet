@@ -40,7 +40,10 @@ pub struct ModelInfo {
 
 pub struct WhisperEngine {
     models_dir: PathBuf,
-    current_context: Arc<RwLock<Option<WhisperContext>>>,
+    // NEW: multiple loaded contexts keyed by model name, so several transcription
+    // tasks can run concurrently using different downloaded models.
+    loaded_contexts: Arc<RwLock<HashMap<String, WhisperContext>>>,
+    // Backward-compatible "current" model for callers that don't specify one.
     current_model: Arc<RwLock<Option<String>>>,
     available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
     // State tracking for smart logging
@@ -168,7 +171,7 @@ impl WhisperEngine {
 
         let engine = Self {
             models_dir,
-            current_context: Arc::new(RwLock::new(None)),
+            loaded_contexts: Arc::new(RwLock::new(HashMap::new())),
             current_model: Arc::new(RwLock::new(None)),
             available_models: Arc::new(RwLock::new(HashMap::new())),
             // Initialize state tracking
@@ -279,7 +282,17 @@ impl WhisperEngine {
         Ok(models)
     }
 
+    /// Load a Whisper model.  If it is already loaded, this is a no-op.
+    /// The model becomes the engine's "current" model for backward-compatible
+    /// single-model APIs, and is also stored in the multi-model map.
     pub async fn load_model(&self, model_name: &str) -> Result<()> {
+        self.load_model_internal(model_name, true).await
+    }
+
+    async fn load_model_internal(&self,
+        model_name: &str,
+        set_as_current: bool,
+    ) -> Result<()> {
         let models = self.available_models.read().await;
         let model_info = models
             .get(model_name)
@@ -287,20 +300,13 @@ impl WhisperEngine {
 
         match model_info.status {
             ModelStatus::Available => {
-                // FIX 5: Check if this model is already loaded
-                if let Some(current_model) = self.current_model.read().await.as_ref() {
-                    if current_model == model_name {
-                        log::info!("Model {} is already loaded, skipping reload", model_name);
-                        return Ok(());
+                // Already loaded in the multi-model map?
+                if self.loaded_contexts.read().await.contains_key(model_name) {
+                    log::info!("Model {} is already loaded, skipping reload", model_name);
+                    if set_as_current {
+                        *self.current_model.write().await = Some(model_name.to_string());
                     }
-
-                    // FIX 5: Unload current model before loading new one
-                    log::info!(
-                        "Unloading current model '{}' before loading '{}'",
-                        current_model,
-                        model_name
-                    );
-                    self.unload_model().await;
+                    return Ok(());
                 }
 
                 log::info!("Loading model: {}", model_name);
@@ -344,9 +350,14 @@ impl WhisperEngine {
                     // Suppressor dropped here, stderr restored
                 };
 
-                // Update current context and model
-                *self.current_context.write().await = Some(ctx);
-                *self.current_model.write().await = Some(model_name.to_string());
+                // Store in the multi-model map and optionally make it current
+                self.loaded_contexts
+                    .write()
+                    .await
+                    .insert(model_name.to_string(), ctx);
+                if set_as_current {
+                    *self.current_model.write().await = Some(model_name.to_string());
+                }
 
                 // Enhanced acceleration status reporting
                 let acceleration_status = acceleration.status_label();
@@ -368,11 +379,20 @@ impl WhisperEngine {
         }
     }
 
+    /// Load a model into the multi-model map WITHOUT making it the current model.
+    /// Useful when a background task needs a specific model while the live
+    /// recording continues on another model.
+    pub async fn load_model_concurrent(&self, model_name: &str) -> Result<()> {
+        self.load_model_internal(model_name, false).await
+    }
+
+    /// Unload every loaded model.
     pub async fn unload_model(&self) -> bool {
-        let mut ctx_guard = self.current_context.write().await;
-        let unloaded = ctx_guard.take().is_some();
+        let mut contexts = self.loaded_contexts.write().await;
+        let unloaded = !contexts.is_empty();
+        contexts.clear();
         if unloaded {
-            log::info!("📉Whisper model unloaded");
+            log::info!("📉All Whisper models unloaded");
         }
 
         let mut model_name_guard = self.current_model.write().await;
@@ -381,12 +401,38 @@ impl WhisperEngine {
         unloaded
     }
 
+    /// Unload a specific model, leaving other loaded models intact.
+    pub async fn unload_model_named(&self, model_name: &str) -> bool {
+        let removed = self.loaded_contexts.write().await.remove(model_name).is_some();
+        if removed {
+            log::info!("📉Whisper model '{}' unloaded", model_name);
+        }
+
+        // If we just removed the current model, clear the current marker too.
+        let mut current = self.current_model.write().await;
+        if current.as_deref() == Some(model_name) {
+            current.take();
+        }
+
+        removed
+    }
+
+    /// Return the names of all currently loaded models.
+    pub async fn loaded_models(&self) -> Vec<String> {
+        self.loaded_contexts.read().await.keys().cloned().collect()
+    }
+
     pub async fn get_current_model(&self) -> Option<String> {
         self.current_model.read().await.clone()
     }
 
     pub async fn is_model_loaded(&self) -> bool {
-        self.current_context.read().await.is_some()
+        !self.loaded_contexts.read().await.is_empty()
+    }
+
+    /// True if the named model is currently loaded.
+    pub async fn is_model_loaded_named(&self, model_name: &str) -> bool {
+        self.loaded_contexts.read().await.contains_key(model_name)
     }
 
     // Enhanced function to clean repetitive text patterns and meaningless outputs
@@ -544,16 +590,34 @@ impl WhisperEngine {
         repeated_words as f32 / total_words
     }
 
-    /// Transcribe audio with streaming support for partial results and adaptive quality
+    /// Transcribe audio using the currently selected model.
     pub async fn transcribe_audio_with_confidence(
         &self,
         audio_data: Vec<f32>,
         language: Option<String>,
     ) -> Result<(String, f32, bool)> {
-        let ctx_lock = self.current_context.read().await;
-        let ctx = ctx_lock
-            .as_ref()
+        let model_name = self
+            .get_current_model()
+            .await
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
+        let text = self
+            .transcribe_audio_with_model_basic(audio_data, &model_name, language)
+            .await?;
+        Ok((text, 0.85, false))
+    }
+
+    /// Transcribe audio with an explicitly named model, returning confidence/partial.
+    /// The model must already be loaded (via `load_model` or `load_model_concurrent`).
+    pub async fn transcribe_audio_with_model(
+        &self,
+        audio_data: Vec<f32>,
+        model_name: &str,
+        language: Option<String>,
+    ) -> Result<(String, f32, bool)> {
+        let ctx_lock = self.loaded_contexts.read().await;
+        let ctx = ctx_lock
+            .get(model_name)
+            .ok_or_else(|| anyhow!("Model '{}' is not loaded", model_name))?;
 
         // Get adaptive configuration based on hardware
         let hardware_profile = crate::audio::HardwareProfile::detect();
@@ -672,10 +736,24 @@ impl WhisperEngine {
         audio_data: Vec<f32>,
         language: Option<String>,
     ) -> Result<String> {
-        let ctx_lock = self.current_context.read().await;
-        let ctx = ctx_lock
-            .as_ref()
+        let model_name = self
+            .get_current_model()
+            .await
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
+        self.transcribe_audio_with_model_basic(audio_data, &model_name, language)
+            .await
+    }
+
+    pub async fn transcribe_audio_with_model_basic(
+        &self,
+        audio_data: Vec<f32>,
+        model_name: &str,
+        language: Option<String>,
+    ) -> Result<String> {
+        let ctx_lock = self.loaded_contexts.read().await;
+        let ctx = ctx_lock
+            .get(model_name)
+            .ok_or_else(|| anyhow!("Model '{}' is not loaded", model_name))?;
 
         // Get adaptive configuration based on hardware
         let hardware_profile = crate::audio::HardwareProfile::detect();

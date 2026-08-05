@@ -509,8 +509,8 @@ async fn run_retranscription<R: Runtime>(
 
     for segment in &segments {
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -519,6 +519,7 @@ async fn run_retranscription<R: Runtime>(
         .bind(segment.audio_start_time)
         .bind(segment.audio_end_time)
         .bind(segment.duration)
+        .bind(&segment.speaker)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
@@ -616,20 +617,11 @@ async fn get_or_init_whisper<R: Runtime>(
                 None => get_configured_whisper_model(app).await?,
             };
 
-            // Check if the correct model is already loaded
-            let current_model = e.get_current_model().await;
-            let needs_load = match &current_model {
-                Some(loaded) => loaded != &target_model,
-                None => true,
-            };
+            // Load the requested model concurrently, leaving any other loaded model intact
+            // so live recordings or other batch jobs can keep using their model.
+            if !e.is_model_loaded_named(&target_model).await {
+                info!("Loading Whisper model '{}' concurrently", target_model);
 
-            if needs_load {
-                info!(
-                    "Loading Whisper model '{}' (current: {:?})",
-                    target_model, current_model
-                );
-
-                // Discover available models first (populates the internal cache)
                 info!("Discovering available Whisper models...");
                 if let Err(discover_err) = e.discover_models().await {
                     warn!(
@@ -638,7 +630,7 @@ async fn get_or_init_whisper<R: Runtime>(
                     );
                 }
 
-                match e.load_model(&target_model).await {
+                match e.load_model_concurrent(&target_model).await {
                     Ok(_) => {
                         info!("Whisper model '{}' loaded successfully", target_model);
                         Ok(e)

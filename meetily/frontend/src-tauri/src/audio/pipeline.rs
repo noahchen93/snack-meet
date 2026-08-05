@@ -16,6 +16,7 @@ use super::audio_processing::{
 use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, DeviceType, RecordingState};
 use super::vad::ContinuousVadProcessor;
+use crate::audio::transcription::TranscriptionChunk;
 
 /// Ring buffer for synchronized audio mixing
 /// Accumulates samples from mic and system streams until we have aligned windows
@@ -727,7 +728,7 @@ impl AudioCapture {
 /// Uses Voice Activity Detection to segment speech in real-time and send only speech to Whisper
 pub struct AudioPipeline {
     receiver: mpsc::UnboundedReceiver<AudioChunk>,
-    transcription_sender: mpsc::UnboundedSender<AudioChunk>,
+    transcription_sender: mpsc::UnboundedSender<TranscriptionChunk>,
     state: Arc<RecordingState>,
     vad_processor: ContinuousVadProcessor,
     sample_rate: u32,
@@ -742,12 +743,15 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    // Speaker diarization: estimate local vs. remote speaker from channel energy
+    speaker_estimator: crate::audio::transcription::diarization::ChannelEnergyEstimator,
+    window_duration_ms: f64,
 }
 
 impl AudioPipeline {
     pub fn new(
         receiver: mpsc::UnboundedReceiver<AudioChunk>,
-        transcription_sender: mpsc::UnboundedSender<AudioChunk>,
+        transcription_sender: mpsc::UnboundedSender<TranscriptionChunk>,
         state: Arc<RecordingState>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
@@ -804,6 +808,7 @@ impl AudioPipeline {
 
         // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
         let _ = target_chunk_duration_ms;
+        let window_duration_ms = 600.0; // must match AudioMixerRingBuffer window_ms
 
         Self {
             receiver,
@@ -821,6 +826,9 @@ impl AudioPipeline {
             ring_buffer,
             mixer,
             recording_sender_for_mixed: None, // Will be set by manager
+            // Speaker diarization
+            speaker_estimator: crate::audio::transcription::diarization::ChannelEnergyEstimator::new(),
+            window_duration_ms,
         }
     }
 
@@ -897,6 +905,16 @@ impl AudioPipeline {
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
                     while self.ring_buffer.can_mix() {
                         if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
+                            // Record per-channel energy before mixing so we can later attribute
+                            // each VAD speech segment to the microphone (local) or system audio
+                            // (remote).  The estimator keeps a monotonic timeline aligned with the
+                            // VAD processor's internal clock, which also starts at 0 ms.
+                            self.speaker_estimator.add_window(
+                                self.window_duration_ms,
+                                &mic_window,
+                                &sys_window,
+                            );
+
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
 
@@ -915,18 +933,27 @@ impl AudioPipeline {
 
                                         if segment.samples.len() >= 800 {
                                             // Minimum 50ms at 16kHz - matches Parakeet capability
-                                            info!(
-                                                "📤 Sending VAD segment: {:.1}ms, {} samples",
-                                                duration_ms,
-                                                segment.samples.len()
+                                            let speaker = self.speaker_estimator.estimate(
+                                                segment.start_timestamp_ms,
+                                                segment.end_timestamp_ms,
                                             );
 
-                                            let transcription_chunk = AudioChunk {
-                                                data: segment.samples,
-                                                sample_rate: 16000,
-                                                timestamp: segment.start_timestamp_ms / 1000.0,
-                                                chunk_id: self.chunk_id_counter,
-                                                device_type: DeviceType::Microphone, // Mixed audio
+                                            info!(
+                                                "📤 Sending VAD segment: {:.1}ms, {} samples, speaker={:?}",
+                                                duration_ms,
+                                                segment.samples.len(),
+                                                speaker
+                                            );
+
+                                            let transcription_chunk = TranscriptionChunk {
+                                                audio: AudioChunk {
+                                                    data: segment.samples,
+                                                    sample_rate: 16000,
+                                                    timestamp: segment.start_timestamp_ms / 1000.0,
+                                                    chunk_id: self.chunk_id_counter,
+                                                    device_type: DeviceType::Microphone, // Mixed audio
+                                                },
+                                                speaker: Some(speaker),
                                             };
 
                                             if let Err(e) =
@@ -1002,12 +1029,20 @@ impl AudioPipeline {
                             segment.samples.len()
                         );
 
-                        let transcription_chunk = AudioChunk {
-                            data: segment.samples,
-                            sample_rate: 16000,
-                            timestamp: segment.start_timestamp_ms / 1000.0,
-                            chunk_id: self.chunk_id_counter,
-                            device_type: DeviceType::Microphone,
+                        let speaker = self.speaker_estimator.estimate(
+                            segment.start_timestamp_ms,
+                            segment.end_timestamp_ms,
+                        );
+
+                        let transcription_chunk = TranscriptionChunk {
+                            audio: AudioChunk {
+                                data: segment.samples,
+                                sample_rate: 16000,
+                                timestamp: segment.start_timestamp_ms / 1000.0,
+                                chunk_id: self.chunk_id_counter,
+                                device_type: DeviceType::Microphone,
+                            },
+                            speaker: Some(speaker),
                         };
 
                         if let Err(e) = self.transcription_sender.send(transcription_chunk) {
@@ -1051,7 +1086,7 @@ impl AudioPipelineManager {
     pub fn start(
         &mut self,
         state: Arc<RecordingState>,
-        transcription_sender: mpsc::UnboundedSender<AudioChunk>,
+        transcription_sender: mpsc::UnboundedSender<TranscriptionChunk>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
         recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,

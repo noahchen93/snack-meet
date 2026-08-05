@@ -14,16 +14,19 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::task::JoinHandle;
 
 use super::{
-    default_input_device,  // Get default microphone
-    default_output_device, // Get default system audio
     parse_audio_device,
-    DeviceEvent,
-    DeviceMonitorType,
+    default_input_device,   // Get default microphone
+    default_output_device,  // Get default system audio
     RecordingManager,
+    DeviceEvent,
+    DeviceMonitorType
 };
 
 // Import transcription modules
-use super::transcription::{self, reset_speech_detected_flag};
+use super::transcription::{
+    self,
+    reset_speech_detected_flag,
+};
 
 // Re-export TranscriptUpdate for backward compatibility
 pub use super::transcription::TranscriptUpdate;
@@ -77,13 +80,6 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         meeting_name
     );
 
-    if !super::permissions::ensure_microphone_permission().await? {
-        return Err(
-            "Microphone permission denied. Enable Snack Meet in System Settings → Privacy & Security → Microphone."
-                .to_string(),
-        );
-    }
-
     let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
 
     // Check if already recording
@@ -98,11 +94,18 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
         error!("Model validation failed: {}", validation_error);
 
-        // Emit error event for frontend - actionable: false to show toast instead of modal
-        // (download progress is already shown in top-right toast)
+        // Emit error event for frontend - actionable: false to show toast instead of modal.
+        // Distinguish a missing model from an in-progress download so the toast is useful.
+        let user_message = if validation_error.to_lowercase().contains("download")
+            || validation_error.to_lowercase().contains("downloading")
+        {
+            "Recording cannot start: the transcription model is still downloading. Please wait for the download to complete."
+        } else {
+            "Recording cannot start: the transcription model is not ready. Please download a model or switch to Whisper in Settings > Transcription."
+        };
         let _ = app.emit("transcription-error", serde_json::json!({
             "error": validation_error,
-            "userMessage": "Recording cannot start: Transcription model is still downloading. Please wait for the download to complete.",
+            "userMessage": user_message,
             "actionable": false
         }));
 
@@ -122,17 +125,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
             Ok(prefs) => {
                 info!("📋 Loaded recording preferences: auto_save={}, preferred_mic={:?}, preferred_system={:?}",
                       prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device);
-                (
-                    prefs.auto_save,
-                    prefs.preferred_mic_device,
-                    prefs.preferred_system_device,
-                )
+                (prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device)
             }
             Err(e) => {
-                warn!(
-                    "Failed to load recording preferences, using defaults: {}",
-                    e
-                );
+                warn!("Failed to load recording preferences, using defaults: {}", e);
                 (true, None, None)
             }
         };
@@ -149,10 +145,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                     Some(Arc::new(device))
                 }
                 Err(e) => {
-                    warn!(
-                        "⚠️ Preferred microphone '{}' not available: {}",
-                        pref_name, e
-                    );
+                    warn!("⚠️ Preferred microphone '{}' not available: {}", pref_name, e);
                     warn!("   Falling back to system default microphone...");
                     match default_input_device() {
                         Ok(device) => {
@@ -160,9 +153,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                             Some(Arc::new(device))
                         }
                         Err(default_err) => {
-                            error!(
-                                "❌ No microphone available (preferred and default both failed)"
-                            );
+                            error!("❌ No microphone available (preferred and default both failed)");
                             return Err(format!(
                                 "No microphone device available. Preferred device '{}' not found, and default microphone unavailable: {}",
                                 pref_name, default_err
@@ -192,20 +183,14 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // ============================================================================
     let system_device = match preferred_system_name {
         Some(pref_name) => {
-            info!(
-                "🔊 Attempting to use preferred system audio: '{}'",
-                pref_name
-            );
+            info!("🔊 Attempting to use preferred system audio: '{}'", pref_name);
             match parse_audio_device(&pref_name) {
                 Ok(device) => {
                     info!("✅ Using preferred system audio: '{}'", device.name);
                     Some(Arc::new(device))
                 }
                 Err(e) => {
-                    warn!(
-                        "⚠️ Preferred system audio '{}' not available: {}",
-                        pref_name, e
-                    );
+                    warn!("⚠️ Preferred system audio '{}' not available: {}", pref_name, e);
                     warn!("   Falling back to system default...");
                     match default_output_device() {
                         Ok(device) => {
@@ -241,7 +226,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
         // Example: Meeting 2025-10-03_08-25-23
         let now = chrono::Local::now();
-        format!("Meeting {}", now.format("%Y-%m-%d_%H-%M-%S"))
+        format!(
+            "Meeting {}",
+            now.format("%Y-%m-%d_%H-%M-%S")
+        )
     });
     manager.set_meeting_name(Some(effective_meeting_name));
 
@@ -294,6 +282,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                     display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
                     confidence: update.confidence,
                     sequence_id: update.sequence_id,
+                    speaker: update.speaker.clone(),
                 };
 
                 // Save to recording manager
@@ -310,15 +299,11 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     }
 
     // Emit success event
-    app.emit(
-        "recording-started",
-        serde_json::json!({
-            "message": "Recording started successfully with parallel processing",
-            "devices": ["Default Microphone", "Default System Audio"],
-            "workers": 3
-        }),
-    )
-    .map_err(|e| e.to_string())?;
+    app.emit("recording-started", serde_json::json!({
+        "message": "Recording started successfully with parallel processing",
+        "devices": ["Default Microphone", "Default System Audio"],
+        "workers": 3
+    })).map_err(|e| e.to_string())?;
 
     // Update tray menu to reflect recording state
     crate::tray::update_tray_menu(&app);
@@ -349,13 +334,6 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         mic_device_name, system_device_name, meeting_name
     );
 
-    if !super::permissions::ensure_microphone_permission().await? {
-        return Err(
-            "Microphone permission denied. Enable Snack Meet in System Settings → Privacy & Security → Microphone."
-                .to_string(),
-        );
-    }
-
     let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
 
     // Check if already recording
@@ -370,11 +348,18 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
         error!("Model validation failed: {}", validation_error);
 
-        // Emit error event for frontend - actionable: false to show toast instead of modal
-        // (download progress is already shown in top-right toast)
+        // Emit error event for frontend - actionable: false to show toast instead of modal.
+        // Distinguish a missing model from an in-progress download so the toast is useful.
+        let user_message = if validation_error.to_lowercase().contains("download")
+            || validation_error.to_lowercase().contains("downloading")
+        {
+            "Recording cannot start: the transcription model is still downloading. Please wait for the download to complete."
+        } else {
+            "Recording cannot start: the transcription model is not ready. Please download a model or switch to Whisper in Settings > Transcription."
+        };
         let _ = app.emit("transcription-error", serde_json::json!({
             "error": validation_error,
-            "userMessage": "Recording cannot start: Transcription model is still downloading. Please wait for the download to complete.",
+            "userMessage": user_message,
             "actionable": false
         }));
 
@@ -408,17 +393,11 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Load recording preferences to check auto_save setting
     let auto_save = match super::recording_preferences::load_recording_preferences(&app).await {
         Ok(prefs) => {
-            info!(
-                "📋 Loaded recording preferences: auto_save={}",
-                prefs.auto_save
-            );
+            info!("📋 Loaded recording preferences: auto_save={}", prefs.auto_save);
             prefs.auto_save
         }
         Err(e) => {
-            warn!(
-                "Failed to load recording preferences, defaulting to auto_save=true: {}",
-                e
-            );
+            warn!("Failed to load recording preferences, defaulting to auto_save=true: {}", e);
             true // Default to saving if preferences can't be loaded
         }
     };
@@ -426,7 +405,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
         let now = chrono::Local::now();
-        format!("Meeting {}", now.format("%Y-%m-%d_%H-%M-%S"))
+        format!(
+            "Meeting {}",
+            now.format("%Y-%m-%d_%H-%M-%S")
+        )
     });
     manager.set_meeting_name(Some(effective_meeting_name));
 
@@ -479,6 +461,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                     display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
                     confidence: update.confidence,
                     sequence_id: update.sequence_id,
+                    speaker: update.speaker.clone(),
                 };
 
                 // Save to recording manager
@@ -495,18 +478,14 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     }
 
     // Emit success event
-    app.emit(
-        "recording-started",
-        serde_json::json!({
-            "message": "Recording started with custom devices and parallel processing",
-            "devices": [
-                mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
-                system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
-            ],
-            "workers": 3
-        }),
-    )
-    .map_err(|e| e.to_string())?;
+    app.emit("recording-started", serde_json::json!({
+        "message": "Recording started with custom devices and parallel processing",
+        "devices": [
+            mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
+            system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
+        ],
+        "workers": 3
+    })).map_err(|e| e.to_string())?;
 
     // Update tray menu to reflect recording state
     crate::tray::update_tray_menu(&app);
@@ -540,6 +519,15 @@ pub async fn stop_recording<R: Runtime>(
             "progress": 20
         }),
     );
+
+    // Capture duration BEFORE we stop the recording state, then pass it through the
+    // shutdown path so the final metadata can still report the real meeting length.
+    let recording_duration = if let Some(manager) = RECORDING_MANAGER.lock().unwrap().as_ref() {
+        manager.get_active_recording_duration()
+    } else {
+        None
+    };
+    info!("Captured active recording duration before stop: {:?}s", recording_duration);
 
     // Step 1: Stop audio capture immediately (no more new chunks) with proper error handling
     let manager_for_cleanup = {
@@ -626,10 +614,8 @@ pub async fn stop_recording<R: Runtime>(
         // Wait up to 10 minutes for transcription completion to prevent indefinite hangs
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(600), // 10 minutes max
-            task_handle,
-        )
-        .await
-        {
+            task_handle
+        ).await {
             Ok(Ok(())) => {
                 info!("✅ ALL transcription chunks processed successfully - no data lost");
             }
@@ -664,7 +650,11 @@ pub async fn stop_recording<R: Runtime>(
     // Determine which provider was used and unload the appropriate model (with timeout)
     let config = match tokio::time::timeout(
         tokio::time::Duration::from_secs(30), // 30 seconds max for DB operation
-        crate::api::api::api_get_transcript_config(app.clone(), app.clone().state(), None),
+        crate::api::api::api_get_transcript_config(
+            app.clone(),
+            app.clone().state(),
+            None,
+        )
     )
     .await
     {
@@ -698,10 +688,7 @@ pub async fn stop_recording<R: Runtime>(
                 info!("Current Parakeet model before unload: '{}'", current_model);
 
                 if engine.unload_model().await {
-                    info!(
-                        "✅ Parakeet model '{}' unloaded successfully",
-                        current_model
-                    );
+                    info!("✅ Parakeet model '{}' unloaded successfully", current_model);
                 } else {
                     warn!("⚠️ Failed to unload Parakeet model '{}'", current_model);
                 }
@@ -758,17 +745,7 @@ pub async fn stop_recording<R: Runtime>(
     };
 
     // Now perform async analytics tracking without holding manager reference
-    if let Some((
-        total_duration,
-        active_duration,
-        pause_duration,
-        transcript_segments_count,
-        had_fatal_error,
-        mic_device_name,
-        sys_device_name,
-        chunks_processed,
-    )) = analytics_data
-    {
+    if let Some((total_duration, active_duration, pause_duration, transcript_segments_count, had_fatal_error, mic_device_name, sys_device_name, chunks_processed)) = analytics_data {
         info!("📊 Collecting analytics for meeting end");
 
         // Helper function to classify device type from device name (privacy-safe)
@@ -780,8 +757,7 @@ pub async fn stop_recording<R: Runtime>(
                 || name_lower.contains("beats")
                 || name_lower.contains("headphones")
                 || name_lower.contains("bt ")
-                || name_lower.contains("wireless")
-            {
+                || name_lower.contains("wireless") {
                 "Bluetooth"
             } else {
                 "Wired"
@@ -800,20 +776,23 @@ pub async fn stop_recording<R: Runtime>(
             _ => None,
         };
 
-        let (transcription_provider, transcription_model) =
-            transcription_config.unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+        let (transcription_provider, transcription_model) = transcription_config
+            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
 
         // Get summary model info from API
-        let summary_config =
-            match crate::api::api::api_get_model_config(app.clone(), app.clone().state(), None)
-                .await
-            {
-                Ok(Some(config)) => Some((config.provider, config.model)),
-                _ => None,
-            };
+        let summary_config = match crate::api::api::api_get_model_config(
+            app.clone(),
+            app.clone().state(),
+            None,
+        )
+        .await
+        {
+            Ok(Some(config)) => Some((config.provider, config.model)),
+            _ => None,
+        };
 
-        let (summary_provider, summary_model) =
-            summary_config.unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+        let (summary_provider, summary_model) = summary_config
+            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
 
         // Classify device types (privacy-safe)
         let microphone_device_type = mic_device_name
@@ -866,12 +845,12 @@ pub async fn stop_recording<R: Runtime>(
         let meeting_folder = manager.get_meeting_folder();
         let meeting_name = manager.get_meeting_name();
 
+        // The recording state was already stopped during force-flush, so its
+        // start instant is gone. Re-use the duration we captured before flush.
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(300), // 5 minutes max for file I/O
-            manager.save_recording_only(&app),
-        )
-        .await
-        {
+            manager.save_recording_only(&app, recording_duration)
+        ).await {
             Ok(Ok(_)) => {
                 info!("✅ Recording data saved successfully during cleanup");
             }
@@ -902,7 +881,10 @@ pub async fn stop_recording<R: Runtime>(
     // NOTE: We do NOT save to database here. The frontend will save after all transcripts are displayed.
     // This ensures the user sees all transcripts streaming in before the database save happens.
     let (folder_path_str, meeting_name_str) = match (&meeting_folder, &meeting_name) {
-        (Some(path), Some(name)) => (Some(path.to_string_lossy().to_string()), Some(name.clone())),
+        (Some(path), Some(name)) => (
+            Some(path.to_string_lossy().to_string()),
+            Some(name.clone()),
+        ),
         _ => (None, None),
     };
 
@@ -1069,9 +1051,7 @@ pub async fn get_recording_state() -> serde_json::Value {
 pub async fn get_meeting_folder_path() -> Result<Option<String>, String> {
     let manager_guard = RECORDING_MANAGER.lock().unwrap();
     if let Some(manager) = manager_guard.as_ref() {
-        Ok(manager
-            .get_meeting_folder()
-            .map(|p| p.to_string_lossy().to_string()))
+        Ok(manager.get_meeting_folder().map(|p| p.to_string_lossy().to_string()))
     } else {
         Ok(None)
     }
@@ -1080,8 +1060,7 @@ pub async fn get_meeting_folder_path() -> Result<Option<String>, String> {
 /// Get accumulated transcript segments from current recording session
 /// Used for syncing frontend state after page reload during active recording
 #[tauri::command]
-pub async fn get_transcript_history(
-) -> Result<Vec<crate::audio::recording_saver::TranscriptSegment>, String> {
+pub async fn get_transcript_history() -> Result<Vec<crate::audio::recording_saver::TranscriptSegment>, String> {
     let manager_guard = RECORDING_MANAGER.lock().unwrap();
 
     if let Some(manager) = manager_guard.as_ref() {
@@ -1126,20 +1105,18 @@ pub enum DeviceEventResponse {
 impl From<DeviceEvent> for DeviceEventResponse {
     fn from(event: DeviceEvent) -> Self {
         match event {
-            DeviceEvent::DeviceDisconnected {
-                device_name,
-                device_type,
-            } => DeviceEventResponse::DeviceDisconnected {
-                device_name,
-                device_type: format!("{:?}", device_type),
-            },
-            DeviceEvent::DeviceReconnected {
-                device_name,
-                device_type,
-            } => DeviceEventResponse::DeviceReconnected {
-                device_name,
-                device_type: format!("{:?}", device_type),
-            },
+            DeviceEvent::DeviceDisconnected { device_name, device_type } => {
+                DeviceEventResponse::DeviceDisconnected {
+                    device_name,
+                    device_type: format!("{:?}", device_type),
+                }
+            }
+            DeviceEvent::DeviceReconnected { device_name, device_type } => {
+                DeviceEventResponse::DeviceReconnected {
+                    device_name,
+                    device_type: format!("{:?}", device_type),
+                }
+            }
             DeviceEvent::DeviceListChanged => DeviceEventResponse::DeviceListChanged,
         }
     }
@@ -1186,12 +1163,12 @@ pub async fn get_reconnection_status() -> Result<ReconnectionStatus, String> {
 
     if let Some(manager) = manager_guard.as_ref() {
         let state = manager.get_state();
-        let disconnected_device = state
-            .get_disconnected_device()
-            .map(|(device, device_type)| DisconnectedDeviceInfo {
+        let disconnected_device = state.get_disconnected_device().map(|(device, device_type)| {
+            DisconnectedDeviceInfo {
                 name: device.name.clone(),
                 device_type: format!("{:?}", device_type),
-            });
+            }
+        });
 
         Ok(ReconnectionStatus {
             is_reconnecting: manager.is_reconnecting(),
@@ -1242,9 +1219,7 @@ pub async fn attempt_device_reconnect(
         tokio::runtime::Handle::current().block_on(async {
             let mut manager_guard = RECORDING_MANAGER.lock().unwrap();
             if let Some(manager) = manager_guard.as_mut() {
-                manager
-                    .attempt_device_reconnect(&device_name, monitor_type)
-                    .await
+                manager.attempt_device_reconnect(&device_name, monitor_type).await
             } else {
                 Err(anyhow::anyhow!("Recording not active"))
             }

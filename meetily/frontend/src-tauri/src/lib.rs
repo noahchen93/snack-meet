@@ -381,6 +381,13 @@ pub fn get_language_preference_internal() -> Option<String> {
 }
 
 pub fn run() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .with_writer(std::io::stderr)
+        .try_init();
     log::set_max_level(log::LevelFilter::Info);
 
     let mut builder = tauri::Builder::default();
@@ -595,9 +602,14 @@ pub fn run() {
             whisper_engine::commands::whisper_load_model,
             whisper_engine::commands::whisper_get_current_model,
             whisper_engine::commands::whisper_is_model_loaded,
+            whisper_engine::commands::whisper_is_model_loaded_named,
+            whisper_engine::commands::whisper_loaded_models,
+            whisper_engine::commands::whisper_load_model_concurrent,
+            whisper_engine::commands::whisper_unload_model_named,
             whisper_engine::commands::whisper_has_available_models,
             whisper_engine::commands::whisper_validate_model_ready,
             whisper_engine::commands::whisper_transcribe_audio,
+            whisper_engine::commands::whisper_transcribe_audio_with_model,
             whisper_engine::commands::whisper_get_models_directory,
             whisper_engine::commands::whisper_download_model,
             whisper_engine::commands::whisper_cancel_download,
@@ -633,6 +645,7 @@ pub fn run() {
             trigger_microphone_permission,
             start_recording_with_devices,
             start_recording_with_devices_and_meeting,
+            audio::transcription::engine::check_transcription_readiness,
             start_audio_level_monitoring,
             stop_audio_level_monitoring,
             is_audio_level_monitoring,

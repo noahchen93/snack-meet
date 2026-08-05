@@ -29,13 +29,13 @@ use tracing::{info, warn};
 
 use crate::meeting_audio_probe::{self, AudioProbeHandle};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(4);
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const START_COOLDOWN: Duration = Duration::from_secs(600); // 10 min after a start prompt
 const STOP_COOLDOWN: Duration = Duration::from_secs(120); // after a recording ends
-const CANDIDATE_STABLE_POLLS: u8 = 2;
-const MICROPHONE_TRIGGER_POLLS: u8 = 2;
-const AUDIO_TRIGGER_MS: u64 = 1_500;
-const SILENT_FALLBACK_POLLS: u8 = 6;
+const CANDIDATE_STABLE_POLLS: u8 = 1;
+const MICROPHONE_TRIGGER_POLLS: u8 = 1;
+const AUDIO_TRIGGER_MS: u64 = 1_000;
+const SILENT_FALLBACK_POLLS: u8 = 4;
 const MICROPHONE_WHITELIST_PREFIXES: &[&str] = &["now.typeless"];
 const MICROPHONE_INFRASTRUCTURE_BUNDLES: &[&str] = &["com.apple.CoreSpeech"];
 

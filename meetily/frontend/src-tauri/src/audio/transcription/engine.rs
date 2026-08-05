@@ -4,8 +4,9 @@
 
 use super::provider::TranscriptionProvider;
 use log::{info, warn};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{command, AppHandle, Manager, Runtime};
 
 // ============================================================================
 // TRANSCRIPTION ENGINE ENUM
@@ -461,4 +462,144 @@ pub async fn get_or_init_whisper<R: Runtime>(
     }
 
     Ok(engine)
+}
+
+// ============================================================================
+// FRONTEND READINESS CHECK
+// ============================================================================
+
+/// Snapshot of whether the configured transcription provider is ready to record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionReadiness {
+    pub ready: bool,
+    pub provider: String,
+    pub configured_model: String,
+    pub current_model: Option<String>,
+    pub available_models: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Check whether the currently configured transcription provider has a model
+/// loaded (or available to load). The result is safe to call from the UI before
+/// offering to auto-start a recording.
+#[command]
+pub async fn check_transcription_readiness<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<TranscriptionReadiness, String> {
+    let config =
+        match crate::api::api::api_get_transcript_config(app.clone(), app.clone().state(), None)
+            .await
+        {
+            Ok(Some(config)) => config,
+            Ok(None) => crate::api::api::TranscriptConfig {
+                provider: "parakeet".to_string(),
+                model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
+                api_key: None,
+            },
+            Err(e) => {
+                warn!("⚠️ Failed to get transcript config for readiness check: {}", e);
+                crate::api::api::TranscriptConfig {
+                    provider: "parakeet".to_string(),
+                    model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
+                    api_key: None,
+                }
+            }
+        };
+
+    let mut result = TranscriptionReadiness {
+        ready: false,
+        provider: config.provider.clone(),
+        configured_model: config.model.clone(),
+        current_model: None,
+        available_models: Vec::new(),
+        error: None,
+    };
+
+    match config.provider.as_str() {
+        "localWhisper" => {
+            info!("🔍 Checking Whisper readiness for auto-record");
+            if let Err(init_error) = crate::whisper_engine::commands::whisper_init().await {
+                result.error = Some(format!(
+                    "Failed to initialize speech recognition: {}",
+                    init_error
+                ));
+                return Ok(result);
+            }
+
+            match crate::whisper_engine::commands::whisper_validate_model_ready_with_config(&app)
+                .await
+            {
+                Ok(model_name) => {
+                    info!("✅ Whisper model ready for auto-record: {}", model_name);
+                    result.ready = true;
+                    result.current_model = Some(model_name);
+                }
+                Err(e) => {
+                    warn!("❌ Whisper model not ready for auto-record: {}", e);
+                    result.error = Some(e);
+                }
+            }
+
+            // Collect available model names for the UI message/action
+            if let Some(engine) = {
+                let guard = crate::whisper_engine::commands::WHISPER_ENGINE.lock().unwrap();
+                guard.as_ref().cloned()
+            } {
+                if let Ok(models) = engine.discover_models().await {
+                    result.available_models = models
+                        .iter()
+                        .filter(|m| matches!(m.status, crate::whisper_engine::ModelStatus::Available))
+                        .map(|m| m.name.clone())
+                        .collect();
+                }
+            }
+        }
+        "parakeet" => {
+            info!("🔍 Checking Parakeet readiness for auto-record");
+            if let Err(init_error) = crate::parakeet_engine::commands::parakeet_init().await {
+                result.error = Some(format!(
+                    "Failed to initialize speech recognition: {}",
+                    init_error
+                ));
+                return Ok(result);
+            }
+
+            match crate::parakeet_engine::commands::parakeet_validate_model_ready_with_config(&app)
+                .await
+            {
+                Ok(model_name) => {
+                    info!("✅ Parakeet model ready for auto-record: {}", model_name);
+                    result.ready = true;
+                    result.current_model = Some(model_name);
+                }
+                Err(e) => {
+                    warn!("❌ Parakeet model not ready for auto-record: {}", e);
+                    result.error = Some(e);
+                }
+            }
+
+            if let Some(engine) = {
+                let guard = crate::parakeet_engine::commands::PARAKEET_ENGINE.lock().unwrap();
+                guard.as_ref().cloned()
+            } {
+                if let Ok(models) = engine.discover_models().await {
+                    result.available_models = models
+                        .iter()
+                        .filter(|m| {
+                            matches!(m.status, crate::parakeet_engine::ModelStatus::Available)
+                        })
+                        .map(|m| m.name.clone())
+                        .collect();
+                }
+            }
+        }
+        other => {
+            result.error = Some(format!(
+                "Provider '{}' is not supported for local transcription. Please select 'localWhisper' or 'parakeet'.",
+                other
+            ));
+        }
+    }
+
+    Ok(result)
 }

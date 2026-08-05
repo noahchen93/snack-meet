@@ -211,6 +211,89 @@ pub async fn whisper_is_model_loaded() -> Result<bool, String> {
 }
 
 #[command]
+pub async fn whisper_is_model_loaded_named(model_name: String) -> Result<bool, String> {
+    let engine = {
+        let guard = WHISPER_ENGINE.lock().unwrap();
+        guard.as_ref().cloned()
+    };
+
+    if let Some(engine) = engine {
+        Ok(engine.is_model_loaded_named(&model_name).await)
+    } else {
+        Err("Whisper engine not initialized".to_string())
+    }
+}
+
+#[command]
+pub async fn whisper_loaded_models() -> Result<Vec<String>, String> {
+    let engine = {
+        let guard = WHISPER_ENGINE.lock().unwrap();
+        guard.as_ref().cloned()
+    };
+
+    if let Some(engine) = engine {
+        Ok(engine.loaded_models().await)
+    } else {
+        Err("Whisper engine not initialized".to_string())
+    }
+}
+
+#[command]
+pub async fn whisper_load_model_concurrent(
+    app_handle: tauri::AppHandle,
+    model_name: String,
+) -> Result<(), String> {
+    let engine = {
+        let guard = WHISPER_ENGINE.lock().unwrap();
+        guard.as_ref().cloned()
+    };
+
+    if let Some(engine) = engine {
+        if let Err(e) = app_handle.emit(
+            "model-loading-started",
+            serde_json::json!({ "modelName": model_name }),
+        ) {
+            log::error!("Failed to emit model-loading-started event: {}", e);
+        }
+
+        let result = engine
+            .load_model_concurrent(&model_name)
+            .await
+            .map_err(|e| format!("Failed to load model concurrently: {}", e));
+
+        if result.is_ok() {
+            let _ = app_handle.emit(
+                "model-loading-completed",
+                serde_json::json!({ "modelName": model_name }),
+            );
+        } else if let Err(ref error) = result {
+            let _ = app_handle.emit(
+                "model-loading-failed",
+                serde_json::json!({ "modelName": model_name, "error": error }),
+            );
+        }
+
+        result
+    } else {
+        Err("Whisper engine not initialized".to_string())
+    }
+}
+
+#[command]
+pub async fn whisper_unload_model_named(model_name: String) -> Result<bool, String> {
+    let engine = {
+        let guard = WHISPER_ENGINE.lock().unwrap();
+        guard.as_ref().cloned()
+    };
+
+    if let Some(engine) = engine {
+        Ok(engine.unload_model_named(&model_name).await)
+    } else {
+        Err("Whisper engine not initialized".to_string())
+    }
+}
+
+#[command]
 pub async fn whisper_has_available_models() -> Result<bool, String> {
     let engine = {
         let guard = WHISPER_ENGINE.lock().unwrap();
@@ -403,6 +486,27 @@ pub async fn whisper_transcribe_audio(audio_data: Vec<f32>) -> Result<String, St
             .transcribe_audio(audio_data, language)
             .await
             .map_err(|e| format!("Transcription failed: {}", e))
+    } else {
+        Err("Whisper engine not initialized".to_string())
+    }
+}
+
+#[command]
+pub async fn whisper_transcribe_audio_with_model(
+    audio_data: Vec<f32>,
+    model_name: String,
+) -> Result<String, String> {
+    let engine = {
+        let guard = WHISPER_ENGINE.lock().unwrap();
+        guard.as_ref().cloned()
+    };
+
+    if let Some(engine) = engine {
+        let language = crate::get_language_preference_internal();
+        engine
+            .transcribe_audio_with_model_basic(audio_data, &model_name, language)
+            .await
+            .map_err(|e| format!("Transcription with model '{}' failed: {}", model_name, e))
     } else {
         Err("Whisper engine not initialized".to_string())
     }

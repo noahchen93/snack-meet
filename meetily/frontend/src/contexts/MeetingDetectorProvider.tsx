@@ -6,6 +6,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { confirm } from '@tauri-apps/plugin-dialog';
 import { appDataDir } from '@tauri-apps/api/path';
 import { toast } from 'sonner';
+import { useRouter } from 'next/navigation';
 import { recordingService } from '@/services/recordingService';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { meetingNameFromDetection } from '@/lib/smartMeetingName';
@@ -47,6 +48,15 @@ interface MeetingDetectedPayload {
 interface MeetingEndedPayload {
   reason: string; // "app-exit" | "window-gone"
   bundle_id: string | null;
+}
+
+interface TranscriptionReadiness {
+  ready: boolean;
+  provider: string;
+  configured_model: string;
+  current_model?: string;
+  available_models: string[];
+  error?: string;
 }
 
 async function buildSavePath(): Promise<string> {
@@ -99,6 +109,7 @@ export function MeetingDetectorProvider({ children }: { children: React.ReactNod
   // landing within the same poll, or rapid repeated events).
   const dialogInProgress = useRef(false);
   const { setMeetingTitle } = useTranscripts();
+  const router = useRouter();
 
   useEffect(() => {
     let unlistenDetected: (() => void) | undefined;
@@ -110,6 +121,20 @@ export function MeetingDetectorProvider({ children }: { children: React.ReactNod
         if (dialogInProgress.current || (await isCurrentlyRecording())) return;
         dialogInProgress.current = true;
         try {
+          // Make sure the configured transcription provider actually has a usable
+          // model before we offer to start (or silently start) a recording.
+          const readiness = await invoke<TranscriptionReadiness>('check_transcription_readiness');
+          if (!readiness.ready) {
+            toast.error('无法自动录音：转录模型未就绪', {
+              description: readiness.error || '请下载模型或切换转录引擎',
+              action: {
+                label: '前往设置',
+                onClick: () => router.push('/settings?tab=Transcriptionmodels'),
+              },
+            });
+            return;
+          }
+
           // Microphone use is the user's explicit primary trigger and starts
           // immediately. Window/system-audio-only fallback still asks first.
           if (trigger !== 'microphone') {

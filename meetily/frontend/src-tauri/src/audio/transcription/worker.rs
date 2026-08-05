@@ -2,6 +2,7 @@
 //
 // Parallel transcription worker pool and chunk processing logic.
 
+use super::diarization::TranscriptionChunk;
 use super::engine::TranscriptionEngine;
 use super::provider::TranscriptionError;
 use crate::audio::AudioChunk;
@@ -39,6 +40,8 @@ pub struct TranscriptUpdate {
     pub audio_start_time: f64, // Seconds from recording start (e.g., 125.3)
     pub audio_end_time: f64,   // Seconds from recording start (e.g., 128.6)
     pub duration: f64,         // Segment duration in seconds (e.g., 3.3)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>, // Estimated speaker label (e.g., "local", "remote")
 }
 
 // NOTE: get_transcript_history and get_recording_meeting_name functions
@@ -47,7 +50,7 @@ pub struct TranscriptUpdate {
 /// Optimized parallel transcription task ensuring ZERO chunk loss
 pub fn start_transcription_task<R: Runtime>(
     app: AppHandle<R>,
-    transcription_receiver: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
+    transcription_receiver: tokio::sync::mpsc::UnboundedReceiver<TranscriptionChunk>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("🚀 Starting optimized parallel transcription task - guaranteeing zero chunk loss");
@@ -69,7 +72,7 @@ pub fn start_transcription_task<R: Runtime>(
 
         // Create parallel workers for faster processing while preserving ALL chunks
         const NUM_WORKERS: usize = 1; // Serial processing ensures transcripts emit in chronological order
-        let (work_sender, work_receiver) = tokio::sync::mpsc::unbounded_channel::<AudioChunk>();
+        let (work_sender, work_receiver) = tokio::sync::mpsc::unbounded_channel::<TranscriptionChunk>();
         let work_receiver = Arc::new(tokio::sync::Mutex::new(work_receiver));
 
         // Track completion: AtomicU64 for chunks queued, AtomicU64 for chunks completed
@@ -132,31 +135,37 @@ pub fn start_transcription_task<R: Runtime>(
                         Some(chunk) => {
                             // PERFORMANCE OPTIMIZATION: Reduce logging in hot path
                             // Only log every 10th chunk per worker to reduce I/O overhead
-                            let should_log_this_chunk = chunk.chunk_id % 10 == 0;
+                            let should_log_this_chunk = chunk.audio.chunk_id % 10 == 0;
+                            let speaker_label = chunk.speaker.clone();
 
                             if should_log_this_chunk {
                                 info!(
-                                    "👷 Worker {} processing chunk {} with {} samples",
+                                    "👷 Worker {} processing chunk {} with {} samples (speaker: {:?})",
                                     worker_id,
-                                    chunk.chunk_id,
-                                    chunk.data.len()
+                                    chunk.audio.chunk_id,
+                                    chunk.audio.data.len(),
+                                    speaker_label
                                 );
                             }
 
                             // Check if model is still loaded before processing
                             if !engine_clone.is_model_loaded().await {
-                                warn!("⚠️ Worker {}: Model unloaded, but continuing to preserve chunk {}", worker_id, chunk.chunk_id);
+                                warn!("⚠️ Worker {}: Model unloaded, but continuing to preserve chunk {}", worker_id, chunk.audio.chunk_id);
                                 // Still count as completed even if we can't process
                                 chunks_completed_clone.fetch_add(1, Ordering::SeqCst);
                                 continue;
                             }
 
-                            let chunk_timestamp = chunk.timestamp;
-                            let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
+                            let chunk_timestamp = chunk.audio.timestamp;
+                            let chunk_duration = chunk.audio.data.len() as f64 / chunk.audio.sample_rate as f64;
 
                             // Transcribe with provider-agnostic approach
-                            match transcribe_chunk_with_provider(&engine_clone, chunk, &app_clone)
-                                .await
+                            match transcribe_chunk_with_provider(
+                                &engine_clone,
+                                chunk.audio,
+                                &app_clone,
+                            )
+                            .await
                             {
                                 Ok((transcript, confidence_opt, is_partial)) => {
                                     // Provider-aware confidence threshold
@@ -215,6 +224,7 @@ pub fn start_transcription_task<R: Runtime>(
                                         // This decouples the transcription worker from direct RECORDING_MANAGER access
 
                                         // Emit transcript update with NEW recording-relative timestamps
+                                        let speaker_str = speaker_label.as_ref().map(|s| s.as_str().to_string());
 
                                         let update = TranscriptUpdate {
                                             text: transcript,
@@ -228,6 +238,7 @@ pub fn start_transcription_task<R: Runtime>(
                                             audio_start_time,
                                             audio_end_time,
                                             duration: chunk_duration,
+                                            speaker: speaker_str,
                                         };
 
                                         if let Err(e) = app_clone.emit("transcript-update", &update)
@@ -344,7 +355,7 @@ pub fn start_transcription_task<R: Runtime>(
             let queued = chunks_queued.fetch_add(1, Ordering::SeqCst) + 1;
             info!(
                 "📥 Dispatching chunk {} to workers (total queued: {})",
-                chunk.chunk_id, queued
+                chunk.audio.chunk_id, queued
             );
 
             if let Err(_) = work_sender.send(chunk) {
