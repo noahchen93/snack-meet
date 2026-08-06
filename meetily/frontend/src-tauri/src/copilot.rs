@@ -332,13 +332,14 @@ pub(crate) async fn generate_meeting_title<R: Runtime>(
     }
 
     let system_prompt = "You are a meeting titling assistant. Given the meeting \
-        transcript, produce a concise, specific meeting title of 3 to 10 words \
-        (in the same language as the transcript) that captures the meeting's \
-        purpose and main topic. Return ONLY the title text — no quotes, no \
-        markdown, no extra explanation. Do not use generic words like 'Meeting' \
-        or '会议' alone.";
+        transcript, produce a concise, specific meeting title of 3 to 12 Chinese \
+        characters that captures the meeting's purpose and main topic. \
+        CRITICAL: Always output the title in CHINESE (中文), regardless of the \
+        transcript language. Return ONLY the title text — no quotes, no markdown, \
+        no extra explanation. Do not use generic words like '会议' or 'Meeting' \
+        alone.";
 
-    let user_prompt = format!("Meeting transcript:\n\n{trimmed}\n\nTitle:");
+    let user_prompt = format!("Meeting transcript:\n\n{trimmed}\n\n中文标题:");
 
     let conn = resolve_llm_connection(app).await?;
     let client = reqwest::Client::new();
