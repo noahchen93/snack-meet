@@ -365,26 +365,98 @@ pub(crate) async fn generate_meeting_title<R: Runtime>(
     )
     .await?;
 
-    // Clean the title: trim, strip quotes/markdown heading, collapse whitespace,
-    // and cap length.
-    let title = raw
-        .trim()
-        .trim_matches('"')
-        .trim_start_matches("# ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(40)
-        .collect::<String>()
-        .trim()
-        .to_string();
+    // Extract a clean title from the model output. Local (built-in) models may
+    // emit a "thinking" preamble and a few candidate titles; take the last
+    // plausible candidate line. Cloud models usually return a single title.
+    let title = extract_title_from_output(&raw);
 
     if title.is_empty() {
         Err("Empty title generated".to_string())
     } else {
         Ok(title)
     }
+}
+
+/// Pull a concise title out of a possibly-verbose model reply.
+fn extract_title_from_output(raw: &str) -> String {
+    let mut candidates: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        // Skip thinking/analysis markers and generic meta lines.
+        let lower = l.to_lowercase();
+        if lower.starts_with("thinking")
+            || lower.starts_with("drafting")
+            || lower.starts_with("analyze")
+            || lower.starts_with("the user wants")
+            || lower.starts_with("key topic")
+            || l.starts_with("```")
+        {
+            continue;
+        }
+        // Strip markdown list markers, numbering, quotes, and heading.
+        let cleaned = l
+            .trim_start_matches(['-', '*', '+', '1', '2', '3', '4', '5', '6', '7', '8', '9'])
+            .trim_start_matches(['.', ')', '>', ' ', '\t'])
+            .trim()
+            .trim_matches('"')
+            .trim_start_matches("# ")
+            .trim()
+            .to_string();
+        if cleaned.is_empty() {
+            continue;
+        }
+        // Skip lines that are really a full sentence/analysis (too long to be a
+        // title, or that clearly end with a colon introducing more text).
+        let len = cleaned.chars().count();
+        if len > 40 {
+            continue;
+        }
+        // If a line looks like "最终标题：XXX" or "Title: XXX", keep only the
+        // text after the colon.
+        let after_colon = cleaned
+            .split_once('：')
+            .map(|(_, rest)| rest.trim().to_string())
+            .or_else(|| {
+                cleaned
+                    .split_once(':')
+                    .map(|(prefix, rest)| {
+                        if prefix.len() <= 12 && !rest.contains(' ') {
+                            rest.trim().to_string()
+                        } else {
+                            cleaned.clone()
+                        }
+                    })
+            })
+            .unwrap_or_else(|| cleaned.clone());
+        let candidate = if !after_colon.is_empty() {
+            after_colon
+        } else {
+            cleaned.clone()
+        };
+        if candidate.is_empty() {
+            continue;
+        }
+        candidates.push(candidate);
+    }
+    // Prefer the last candidate (models often list options then conclude). Fall
+    // back to the first non-empty line otherwise.
+    candidates
+        .pop()
+        .or_else(|| {
+            let first = raw.lines().find(|l| !l.trim().is_empty())?;
+            Some(
+                first
+                    .trim()
+                    .trim_matches('"')
+                    .trim_start_matches("# ")
+                    .to_string(),
+            )
+        })
+        .map(|s| s.chars().take(40).collect())
+        .unwrap_or_default()
 }
 
 async fn app_data_dir_path<R: Runtime>(app: &AppHandle<R>) -> Result<std::path::PathBuf, String> {
@@ -536,5 +608,32 @@ pub async fn copilot_save_cloud_config<R: Runtime>(
         .map_err(|e| format!("Failed to serialise cloud config: {e}"))?;
     std::fs::write(&path, raw).map_err(|e| format!("Failed to save cloud config: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_title_from_output;
+
+    #[test]
+    fn cloud_single_title() {
+        assert_eq!(extract_title_from_output("项目进度评审"), "项目进度评审");
+    }
+
+    #[test]
+    fn builtin_thinking_block_uses_last_candidate() {
+        let raw = "thinking\nDrafting titles:\n- 调整交通执法展台位置\n- 讨论展台布局调整\n最终标题：展台布局调整讨论";
+        assert_eq!(extract_title_from_output(raw), "展台布局调整讨论");
+    }
+
+    #[test]
+    fn strips_quotes_and_heading() {
+        assert_eq!(extract_title_from_output("\"产品发布计划\""), "产品发布计划");
+        assert_eq!(extract_title_from_output("# 项目进度同步"), "项目进度同步");
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        assert_eq!(extract_title_from_output(""), "");
+    }
 }
 
