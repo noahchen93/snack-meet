@@ -344,6 +344,12 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
 
+    // Without Screen Recording permission, enumerating windows via
+    // SCShareableContent repeatedly triggers the system permission prompt.
+    // Cache the permission once per poll and skip window enumeration when it's
+    // missing, so we only do mic-based detection (which needs no permission).
+    let has_screen_permission = preflight_screen_capture();
+
     let running = running_monitored_bundles();
 
     if recording_active {
@@ -392,6 +398,11 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
         if !monitored_recording {
             return;
         }
+        // Without Screen Recording permission we cannot inspect windows; rely on
+        // the app still running (already checked above) and skip the window check.
+        if !has_screen_permission {
+            return;
+        }
         let windows = fetch_windows().await;
         let still_meeting = windows.iter().any(|w| {
             &w.bundle == rb && window_suggests_meeting(&w.bundle, &w.title, w.width, w.height)
@@ -438,7 +449,7 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
         }
         return;
     }
-    let windows = if running.is_empty() {
+    let windows = if running.is_empty() || !has_screen_permission {
         Vec::new()
     } else {
         fetch_windows().await
