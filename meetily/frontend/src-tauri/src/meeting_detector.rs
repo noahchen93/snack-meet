@@ -603,14 +603,15 @@ async fn poll_loop<R: Runtime>(app: AppHandle<R>, cancel: CancellationToken) {
 // ---------------------------------------------------------------------------
 
 pub async fn start_detector<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    // Do not let the poll loop touch SCShareableContent before TCC has been granted.
-    // On macOS, an early enumeration can immediately recreate a denied TCC row after
-    // `tccutil reset`, preventing CGRequestScreenCaptureAccess from showing a fresh prompt.
-    if !preflight_screen_capture() {
-        warn!("meeting detector not started: Screen Recording permission is not granted");
-        return Err(
-            "Screen Recording permission is required before meeting detection can start"
-                .to_string(),
+    // Screen Recording permission is only needed for window-based detection
+    // (SCShareableContent). Microphone-based detection (Core Audio process
+    // enumeration) works without it, so we no longer block startup on it. When
+    // the permission is missing, window enumeration simply returns empty and the
+    // detector still catches meeting apps that grab the mic (腾讯会议 etc.).
+    let has_screen = preflight_screen_capture();
+    if !has_screen {
+        warn!(
+            "meeting detector starting without Screen Recording permission (mic-only detection)"
         );
     }
 
