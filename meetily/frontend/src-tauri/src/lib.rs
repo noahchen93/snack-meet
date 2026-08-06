@@ -722,6 +722,7 @@ pub fn run() {
             copilot::copilot_get_context_document,
             copilot::copilot_get_cloud_config,
             copilot::copilot_save_cloud_config,
+            copilot::copilot_smart_rename_meeting,
             // Template commands
             summary::template_commands::api_list_templates,
             summary::template_commands::api_get_template_details,

@@ -169,48 +169,32 @@ fn build_system_prompt(context_doc: &str, is_reminder: bool) -> String {
     }
 }
 
-/// Core ask logic, shared by the automatic reminder and the manual question path.
-async fn copilot_ask_inner<R: Runtime>(
-    app: &AppHandle<R>,
-    context: &str,
-    question: Option<&str>,
-) -> Result<String, String> {
-    let app_state = app
-        .state::<AppState>();
-    let pool = app_state.db_manager.pool();
+/// Resolved LLM connection parameters shared by the copilot, reminder, and
+/// smart-rename paths. A dedicated cloud config wins; otherwise it falls back
+/// to the meeting-summary LLM config.
+struct LlmConnection {
+    provider: LLMProvider,
+    model: String,
+    api_key: String,
+    ollama_endpoint: Option<String>,
+    custom_endpoint: Option<String>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+}
 
+async fn resolve_llm_connection<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<LlmConnection, String> {
+    let app_state = app.state::<AppState>();
+    let pool = app_state.db_manager.pool();
     let app_data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
 
-    let context_doc = read_context_document(&app_data_dir);
     let cloud_config = read_cloud_config(&app_data_dir);
 
-    let is_reminder = question.map(|q| q.trim().is_empty()).unwrap_or(true);
-
-    // Truncate context to the window we can afford.
-    let context_trimmed: String = context
-        .chars()
-        .take(MAX_CONTEXT_CHARS)
-        .collect();
-    let context_doc_trimmed: String = context_doc.chars().take(MAX_CONTEXT_DOC_CHARS).collect();
-
-    let system_prompt = build_system_prompt(&context_doc_trimmed, is_reminder);
-
-    let user_prompt = if is_reminder {
-        format!("Meeting transcript so far:\n\n{context_trimmed}")
-    } else {
-        format!(
-            "Meeting transcript so far:\n\n{context_trimmed}\n\n---\nUser's question: {}",
-            question.unwrap_or_default()
-        )
-    };
-
-    let client = reqwest::Client::new();
-
-    // Decide the effective LLM target: a dedicated cloud config wins, otherwise
-    // fall back to the meeting-summary LLM config.
     let (provider, model, api_key, ollama_endpoint, custom_openai_config) =
         if let Some(cloud) = cloud_config {
             info!(
@@ -240,50 +224,228 @@ async fn copilot_ask_inner<R: Runtime>(
             resolve_llm_config(pool).await?
         };
 
-    let (custom_endpoint, custom_api_key, max_tokens, temperature, top_p) =
-        match &custom_openai_config {
-            Some(cfg) => (
-                Some(cfg.endpoint.clone()),
-                cfg.api_key.clone(),
-                cfg.max_tokens.map(|t| t as u32),
-                cfg.temperature,
-                cfg.top_p,
-            ),
-            None => (None, None, None, None, None),
-        };
+    let (custom_endpoint, max_tokens, temperature, top_p) = match &custom_openai_config {
+        Some(cfg) => (
+            Some(cfg.endpoint.clone()),
+            cfg.max_tokens.map(|t| t as u32),
+            cfg.temperature,
+            cfg.top_p,
+        ),
+        None => (None, None, None, None),
+    };
 
     let final_api_key = if provider == LLMProvider::CustomOpenAI {
-        custom_api_key.unwrap_or_default()
+        custom_openai_config
+            .as_ref()
+            .and_then(|c| c.api_key.clone())
+            .unwrap_or_default()
     } else {
         api_key
     };
 
-    info!(
-        "🤖 Copilot ask: provider={:?} model={} reminder={} context_chars={}",
+    Ok(LlmConnection {
         provider,
         model,
+        api_key: final_api_key,
+        ollama_endpoint,
+        custom_endpoint,
+        max_tokens,
+        temperature,
+        top_p,
+    })
+}
+
+/// Core ask logic, shared by the automatic reminder and the manual question path.
+async fn copilot_ask_inner<R: Runtime>(
+    app: &AppHandle<R>,
+    context: &str,
+    question: Option<&str>,
+) -> Result<String, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
+
+    let context_doc = read_context_document(&app_data_dir);
+
+    let is_reminder = question.map(|q| q.trim().is_empty()).unwrap_or(true);
+
+    // Truncate context to the window we can afford.
+    let context_trimmed: String = context
+        .chars()
+        .take(MAX_CONTEXT_CHARS)
+        .collect();
+    let context_doc_trimmed: String = context_doc.chars().take(MAX_CONTEXT_DOC_CHARS).collect();
+
+    let system_prompt = build_system_prompt(&context_doc_trimmed, is_reminder);
+
+    let user_prompt = if is_reminder {
+        format!("Meeting transcript so far:\n\n{context_trimmed}")
+    } else {
+        format!(
+            "Meeting transcript so far:\n\n{context_trimmed}\n\n---\nUser's question: {}",
+            question.unwrap_or_default()
+        )
+    };
+
+    let conn = resolve_llm_connection(app).await?;
+    let client = reqwest::Client::new();
+
+    info!(
+        "🤖 Copilot ask: provider={:?} model={} reminder={} context_chars={}",
+        conn.provider,
+        conn.model,
         is_reminder,
         context_trimmed.chars().count()
     );
 
     let answer = generate_summary(
         &client,
-        &provider,
-        &model,
-        &final_api_key,
+        &conn.provider,
+        &conn.model,
+        &conn.api_key,
         &system_prompt,
         &user_prompt,
-        ollama_endpoint.as_deref(),
-        custom_endpoint.as_deref(),
-        max_tokens,
-        temperature,
-        top_p,
+        conn.ollama_endpoint.as_deref(),
+        conn.custom_endpoint.as_deref(),
+        conn.max_tokens,
+        conn.temperature,
+        conn.top_p,
         Some(&app_data_dir),
         None,
     )
     .await?;
 
     Ok(answer)
+}
+
+/// Generate a concise meeting title from a transcript using the copilot LLM
+/// config (cloud-first, else summary config). Returns a short string safe for
+/// use as a folder/file name.
+pub(crate) async fn generate_meeting_title<R: Runtime>(
+    app: &AppHandle<R>,
+    transcript: &str,
+) -> Result<String, String> {
+    let trimmed: String = transcript.chars().take(MAX_CONTEXT_CHARS).collect();
+    if trimmed.trim().is_empty() {
+        return Err("Empty transcript".to_string());
+    }
+
+    let system_prompt = "You are a meeting titling assistant. Given the meeting \
+        transcript, produce a concise, specific meeting title of 3 to 10 words \
+        (in the same language as the transcript) that captures the meeting's \
+        purpose and main topic. Return ONLY the title text — no quotes, no \
+        markdown, no extra explanation. Do not use generic words like 'Meeting' \
+        or '会议' alone.";
+
+    let user_prompt = format!("Meeting transcript:\n\n{trimmed}\n\nTitle:");
+
+    let conn = resolve_llm_connection(app).await?;
+    let client = reqwest::Client::new();
+
+    info!(
+        "📛 Generating meeting title: provider={:?} model={}",
+        conn.provider, conn.model
+    );
+
+    let raw = generate_summary(
+        &client,
+        &conn.provider,
+        &conn.model,
+        &conn.api_key,
+        system_prompt,
+        &user_prompt,
+        conn.ollama_endpoint.as_deref(),
+        conn.custom_endpoint.as_deref(),
+        Some(40),
+        conn.temperature,
+        conn.top_p,
+        Some(&app_data_dir_path(app).await?),
+        None,
+    )
+    .await?;
+
+    // Clean the title: trim, strip quotes/markdown heading, collapse whitespace,
+    // and cap length.
+    let title = raw
+        .trim()
+        .trim_matches('"')
+        .trim_start_matches("# ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(40)
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    if title.is_empty() {
+        Err("Empty title generated".to_string())
+    } else {
+        Ok(title)
+    }
+}
+
+async fn app_data_dir_path<R: Runtime>(app: &AppHandle<R>) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data dir: {e}"))
+}
+
+/// Smart-rename a meeting: generate a title from its transcript, update the DB
+/// meeting name, and rename the recording folder. This is independent of the
+/// AI summary flow, so it runs reliably right after a recording is saved.
+/// Returns the new title, or None if there was nothing to rename.
+#[command]
+pub async fn copilot_smart_rename_meeting<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+) -> Result<Option<String>, String> {
+    let pool = app.state::<AppState>().db_manager.pool().clone();
+
+    // Read the transcript for this meeting.
+    let segments: Vec<String> =
+        sqlx::query_scalar("SELECT transcript FROM transcripts WHERE meeting_id = ? ORDER BY timestamp ASC")
+            .bind(&meeting_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("Failed to read transcripts: {e}"))?;
+    let text = segments.join("\n");
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+
+    // Generate a concise title.
+    let title = match generate_meeting_title(&app, &text).await {
+        Ok(t) => t,
+        Err(e) => {
+            info!("Smart rename skipped for {}: {}", meeting_id, e);
+            return Ok(None);
+        }
+    };
+
+    // Update the DB meeting name.
+    if let Err(e) =
+        crate::database::repositories::meeting::MeetingsRepository::update_meeting_name(
+            &pool, &meeting_id, &title,
+        )
+        .await
+    {
+        info!("Smart rename: failed to update meeting name for {}: {}", meeting_id, e);
+        return Err(format!("Failed to update meeting name: {e}"));
+    }
+
+    // Rename the recording folder on disk.
+    if let Err(e) =
+        crate::summary::service::SummaryService::rename_meeting_folder(&pool, &meeting_id, &title)
+            .await
+    {
+        info!("Smart rename: folder rename for {} failed: {}", meeting_id, e);
+    }
+
+    info!("✅ Smart-renamed meeting {} → '{}'", meeting_id, title);
+    Ok(Some(title))
 }
 
 /// Ask the copilot. `question` empty/None → automatic reminder mode.

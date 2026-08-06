@@ -286,7 +286,7 @@ impl SummaryService {
     /// Renames the meeting folder on disk and updates `meetings.folder_path`
     /// to `{sanitized_new_name}_{start--end}`, where the start/end span is the
     /// actual recording time (from metadata.json), in local time.
-    async fn rename_meeting_folder(
+    pub(crate) async fn rename_meeting_folder(
         pool: &SqlitePool,
         meeting_id: &str,
         new_name: &str,
