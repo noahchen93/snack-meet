@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 use crate::meeting_audio_probe::{self, AudioProbeHandle};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_millis(800);
 const START_COOLDOWN: Duration = Duration::from_secs(600); // 10 min after a start prompt
 const STOP_COOLDOWN: Duration = Duration::from_secs(120); // after a recording ends
 const CANDIDATE_STABLE_POLLS: u8 = 1;
@@ -39,8 +39,8 @@ const SILENT_FALLBACK_POLLS: u8 = 4;
 const MICROPHONE_WHITELIST_PREFIXES: &[&str] = &["now.typeless"];
 const MICROPHONE_INFRASTRUCTURE_BUNDLES: &[&str] = &["com.apple.CoreSpeech"];
 // Voice-messaging apps use the microphone both for live calls AND for short,
-// hold-to-talk voice messages. Requiring sustained mic use (~12 s) lets us detect
-// the former while ignoring the latter. Each poll is ~2 s apart.
+// hold-to-talk voice messages. Requiring sustained mic use (~5 s) lets us detect
+// the former while ignoring the latter. Each poll is ~0.8 s apart.
 const VOICE_CALL_MIN_POLLS: u8 = 6;
 
 /// Apps the detector watches, with their display names (main.m:2018).
@@ -538,9 +538,17 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
     };
     let microphone_confirmed = det.microphone_active_polls >= mic_threshold;
     let silent_fallback = det.candidate_stable_polls >= SILENT_FALLBACK_POLLS;
+
+    // Any monitored meeting app is a strong signal on its own — a meeting window
+    // appearing (or the app grabbing the mic) is enough to prompt the user
+    // immediately, even if the mic is silent. Only WeChat/WhatsApp voice-message
+    // apps keep a sustained-use gate. This makes detection nearly instant.
+    let is_fast_trigger = !VOICE_CALL_APPS.contains(&candidate.bundle.as_str())
+        && det.candidate_stable_polls >= CANDIDATE_STABLE_POLLS;
+
     if cooldown_blocks_candidate
         || det.candidate_stable_polls < CANDIDATE_STABLE_POLLS
-        || (!microphone_confirmed && !audio_confirmed && !silent_fallback)
+        || (!is_fast_trigger && !microphone_confirmed && !audio_confirmed && !silent_fallback)
     {
         return;
     }

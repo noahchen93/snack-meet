@@ -135,17 +135,16 @@ export function MeetingDetectorProvider({ children }: { children: React.ReactNod
             return;
           }
 
-          // Microphone use is the user's explicit primary trigger and starts
-          // immediately. Window/system-audio-only fallback still asks first.
-          if (trigger !== 'microphone') {
-            const ok = await confirm(`已检测到 ${app_name} 开启，是否自动录音？`, {
-              title: 'Snack Meet',
-              kind: 'warning',
-              okLabel: '开始录音',
-              cancelLabel: '取消',
-            });
-            if (!ok) return;
-          }
+          // Always prompt the user before recording (a fast confirm dialog), so
+          // they stay in control. This applies to both window- and mic-triggered
+          // meetings (腾讯会议 etc.) — the dialog appears immediately on detection.
+          const ok = await confirm(`已检测到 ${app_name} 开启，是否自动录音？`, {
+            title: 'Snack Meet',
+            kind: 'warning',
+            okLabel: '开始录音',
+            cancelLabel: '取消',
+          });
+          if (!ok) return;
           if (await isCurrentlyRecording()) return; // user started manually meanwhile
           // Only the explicitly confirmed meeting-window path may enter the
           // existing AI summary flow. A microphone-triggered recording remains
