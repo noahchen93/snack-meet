@@ -37,6 +37,8 @@ interface SidebarItem {
   title: string;
   type: 'folder' | 'file';
   children?: SidebarItem[];
+  is_imported?: boolean;
+  is_read?: boolean;
 }
 
 const Sidebar: React.FC = () => {
@@ -72,8 +74,8 @@ const Sidebar: React.FC = () => {
     ollamaEndpoint: null
   });
   const [transcriptModelConfig, setTranscriptModelConfig] = useState<TranscriptModelProps>({
-    provider: 'parakeet',
-    model: 'parakeet-tdt-0.6b-v3-int8',
+    provider: 'localWhisper',
+    model: 'medium-q5_0',
   });
   const [settingsSaveSuccess, setSettingsSaveSuccess] = useState<boolean | null>(null);
 
@@ -103,7 +105,7 @@ const Sidebar: React.FC = () => {
   // }, [settingsSaveSuccess]);
 
 
-  const [deleteModalState, setDeleteModalState] = useState<{ isOpen: boolean; itemId: string | null }>({ isOpen: false, itemId: null });
+  const [deleteModalState, setDeleteModalState] = useState<{ isOpen: boolean; itemId: string | null; deleteFiles?: boolean }>({ isOpen: false, itemId: null, deleteFiles: false });
 
   useEffect(() => {
     // Note: Don't set hardcoded defaults - let DB be the source of truth
@@ -318,17 +320,20 @@ const Sidebar: React.FC = () => {
   }, [sidebarItems, searchQuery, searchResults, expandedFolders]);
 
 
-  const handleDelete = async (itemId: string) => {
-    console.log('Deleting item:', itemId);
-    const payload = {
-      meetingId: itemId
-    };
+  const handleDelete = async (itemId: string, deleteFiles: boolean = false) => {
+    console.log('Deleting item:', itemId, 'deleteFiles:', deleteFiles);
 
     try {
       const { invoke } = await import('@tauri-apps/api/core');
-      await invoke('api_delete_meeting', {
-        meetingId: itemId,
-      });
+      if (deleteFiles) {
+        await invoke('api_delete_meeting_with_files', {
+          meetingId: itemId,
+        });
+      } else {
+        await invoke('api_delete_meeting', {
+          meetingId: itemId,
+        });
+      }
       console.log('Meeting deleted successfully');
       const updatedMeetings = meetings.filter((m: CurrentMeeting) => m.id !== itemId);
       setMeetings(updatedMeetings);
@@ -337,8 +342,10 @@ const Sidebar: React.FC = () => {
       Analytics.trackMeetingDeleted(itemId);
 
       // Show success toast
-      toast.success("Meeting deleted successfully", {
-        description: "All associated data has been removed"
+      toast.success(deleteFiles ? "Meeting and files deleted" : "Meeting deleted successfully", {
+        description: deleteFiles
+          ? "会议记录和原始录音文件已彻底删除"
+          : "All associated data has been removed"
       });
 
       // If deleting the active meeting, navigate to home
@@ -356,9 +363,9 @@ const Sidebar: React.FC = () => {
 
   const handleDeleteConfirm = () => {
     if (deleteModalState.itemId) {
-      handleDelete(deleteModalState.itemId);
+      handleDelete(deleteModalState.itemId, deleteModalState.deleteFiles);
     }
-    setDeleteModalState({ isOpen: false, itemId: null });
+    setDeleteModalState({ isOpen: false, itemId: null, deleteFiles: false });
   };
 
   // Handle modal editing of meeting names
@@ -578,6 +585,15 @@ const Sidebar: React.FC = () => {
               toggleFolder(item.id);
             } else {
               setCurrentMeeting({ id: item.id, title: item.title });
+              // Mark imported meetings as read (clears the red dot).
+              if (item.is_imported && !item.is_read) {
+                invoke('api_mark_meeting_read', { meetingId: item.id }).catch((e) =>
+                  console.error('Failed to mark meeting read:', e)
+                );
+                setMeetings(
+                  meetings.map((m) => (m.id === item.id ? { ...m, is_read: true } : m))
+                );
+              }
               const basePath = item.id.startsWith('intro-call') ? '/' :
                 item.id.includes('-') ? `/meeting-details?id=${item.id}` : `/notes/${item.id}`;
               router.push(basePath);
@@ -615,7 +631,17 @@ const Sidebar: React.FC = () => {
                     <Plus className="w-3.5 h-3.5 text-blue-600" />
                   </div>
                 )}
-                <span className="flex-1 break-words">{item.title}</span>
+                <span className="flex-1 break-words">
+                  {item.title}
+                  {item.is_imported && (
+                    <span className="ml-1 text-[10px] font-medium text-emerald-600">
+                      （扫描导入）
+                    </span>
+                  )}
+                </span>
+                {item.is_imported && !item.is_read && (
+                  <span className="ml-1 flex-shrink-0 w-2 h-2 rounded-full bg-red-500" title="新导入未读" />
+                )}
                 {isMeetingItem && (
                   <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
                     <button
@@ -821,8 +847,13 @@ const Sidebar: React.FC = () => {
       <ConfirmationModal
         isOpen={deleteModalState.isOpen}
         text="Are you sure you want to delete this meeting? This action cannot be undone."
+        showDeleteFilesOption
+        deleteFiles={deleteModalState.deleteFiles}
+        onDeleteFilesChange={(checked) =>
+          setDeleteModalState((s) => ({ ...s, deleteFiles: checked }))
+        }
         onConfirm={handleDeleteConfirm}
-        onCancel={() => setDeleteModalState({ isOpen: false, itemId: null })}
+        onCancel={() => setDeleteModalState({ isOpen: false, itemId: null, deleteFiles: false })}
       />
 
       {/* Edit Meeting Title Modal */}

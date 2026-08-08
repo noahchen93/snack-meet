@@ -9,6 +9,10 @@ pub struct MeetingModel {
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub folder_path: Option<String>,
+    #[serde(default)]
+    pub is_imported: bool,
+    #[serde(default)]
+    pub is_read: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]

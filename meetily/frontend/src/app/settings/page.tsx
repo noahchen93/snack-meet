@@ -42,7 +42,7 @@ export default function SettingsPage() {
           console.log('Loaded saved transcript config:', config);
           setTranscriptModelConfig({
             provider: config.provider || 'localWhisper',
-            model: config.model || 'large-v3',
+            model: config.model || 'medium-q5_0',
             apiKey: config.apiKey || null
           });
         }

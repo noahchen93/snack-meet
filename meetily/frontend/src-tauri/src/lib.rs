@@ -552,6 +552,24 @@ pub fn run() {
                 }
             });
 
+            // Auto-scan the recordings folder for synced transcripts.json files
+            // (e.g. transcribed by a desktop machine and synced via Baidu Netdisk)
+            // and import any new ones into the local database.
+            let scan_app = _app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let prefs = audio::recording_preferences::load_recording_preferences(&scan_app)
+                    .await
+                    .unwrap_or_default();
+                let save_folder = prefs.save_folder.to_string_lossy().to_string();
+                if !save_folder.is_empty() {
+                    if let Err(e) =
+                        audio::import::scan_and_import_transcripts(scan_app, save_folder).await
+                    {
+                        log::warn!("Auto scan-and-import on launch failed: {}", e);
+                    }
+                }
+            });
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -693,8 +711,11 @@ pub fn run() {
             api::api_save_transcript_config,
             api::api_get_transcript_api_key,
             api::api_delete_meeting,
+            api::api_delete_meeting_with_files,
+            api::api_delete_meetings,
             api::api_get_meeting,
             api::api_get_meeting_metadata,
+            api::api_mark_meeting_read,
             api::api_get_meeting_transcripts,
             api::api_save_meeting_title,
             api::api_save_transcript,
@@ -804,6 +825,7 @@ pub fn run() {
             audio::import::start_import_audio_command,
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
+            audio::import::scan_and_import_transcripts,
             // Meeting-window auto-detector (fused Snack Record detection)
             external_trigger::auto_summarize_meeting_command,
             meeting_detector::meeting_detector_start,

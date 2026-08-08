@@ -340,7 +340,10 @@ async fn run_retranscription<R: Runtime>(
         "Loading transcription engine...",
     );
 
-    // Initialize the appropriate engine once (not per-segment)
+    // Initialize the appropriate engine once (not per-segment).
+    // For Whisper we also capture the loaded model name so transcription can use
+    // transcribe_audio_with_model (explicit model) instead of relying on the
+    // engine's "current" model, which the concurrent loader does not set.
     let whisper_engine = if !use_parakeet {
         Some(get_or_init_whisper(&app, model.as_deref()).await?)
     } else {
@@ -425,9 +428,13 @@ async fn run_retranscription<R: Runtime>(
                 .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
             (text, 0.9f32)
         } else {
-            let engine = whisper_engine.as_ref().unwrap();
+            let (engine, model_name) = whisper_engine.as_ref().unwrap();
+            // Use the explicit model name (transcribe_audio_with_model) rather than
+            // transcribe_audio_with_confidence, which depends on the engine's
+            // "current" model — not set by the concurrent loader, so it would fail
+            // with "No model loaded" for every model.
             let (text, conf, _) = engine
-                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
+                .transcribe_audio_with_model(segment.samples.clone(), model_name, language.clone())
                 .await
                 .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
             (text, conf)
@@ -596,12 +603,16 @@ fn emit_progress<R: Runtime>(
     );
 }
 
-/// Get or initialize the Whisper engine, auto-loading the model if needed
-/// If `requested_model` is provided, ensures that specific model is loaded
+/// Get or initialize the Whisper engine, auto-loading the model if needed.
+/// Returns the engine AND the name of the model that is loaded, so callers can
+/// transcribe with an explicit model (transcribe_audio_with_model) instead of
+/// relying on the engine's "current" model — which is NOT set by the concurrent
+/// loader and would otherwise cause "No model loaded" failures for every model.
+/// If `requested_model` is provided, ensures that specific model is loaded.
 async fn get_or_init_whisper<R: Runtime>(
     app: &AppHandle<R>,
     requested_model: Option<&str>,
-) -> Result<Arc<WhisperEngine>> {
+) -> Result<(Arc<WhisperEngine>, String)> {
     use crate::whisper_engine::commands::WHISPER_ENGINE;
 
     let engine = {
@@ -633,7 +644,7 @@ async fn get_or_init_whisper<R: Runtime>(
                 match e.load_model_concurrent(&target_model).await {
                     Ok(_) => {
                         info!("Whisper model '{}' loaded successfully", target_model);
-                        Ok(e)
+                        Ok((e, target_model))
                     }
                     Err(load_err) => {
                         error!(
@@ -649,7 +660,7 @@ async fn get_or_init_whisper<R: Runtime>(
                 }
             } else {
                 info!("Whisper model '{}' already loaded", target_model);
-                Ok(e)
+                Ok((e, target_model))
             }
         }
         None => Err(anyhow!("Whisper engine not initialized")),

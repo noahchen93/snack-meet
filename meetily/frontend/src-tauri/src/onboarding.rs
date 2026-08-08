@@ -191,11 +191,11 @@ pub async fn complete_onboarding<R: Runtime>(
     }
     info!("Saved builtin-ai model config: model={}", model);
 
-    // Save transcription model config (parakeet provider) - always parakeet
+    // Save transcription model config (localWhisper provider) - Chinese + English
     if let Err(e) = SettingsRepository::save_transcript_config(
         pool,
-        "parakeet",
-        crate::config::DEFAULT_PARAKEET_MODEL,
+        "localWhisper",
+        crate::config::DEFAULT_WHISPER_MODEL,
     )
     .await
     {
@@ -203,8 +203,8 @@ pub async fn complete_onboarding<R: Runtime>(
         return Err(format!("Failed to save transcription model config: {}", e));
     }
     info!(
-        "Saved transcription model config: provider=parakeet, model={}",
-        crate::config::DEFAULT_PARAKEET_MODEL
+        "Saved transcription model config: provider=localWhisper, model={}",
+        crate::config::DEFAULT_WHISPER_MODEL
     );
 
     // Step 2: Only NOW mark onboarding as complete (after DB operations succeed)

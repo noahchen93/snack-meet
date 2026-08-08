@@ -5,9 +5,9 @@
 
 /**
  * Default Whisper model for transcription when no preference is configured.
- * This is the recommended balance of accuracy and speed.
+ * medium-q5_0: good Chinese+English accuracy, fast (quantized), already bundled.
  */
-export const DEFAULT_WHISPER_MODEL = 'large-v3-turbo';
+export const DEFAULT_WHISPER_MODEL = 'medium-q5_0';
 
 /**
  * Default Parakeet model for transcription when no preference is configured.

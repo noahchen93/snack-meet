@@ -22,6 +22,9 @@ interface SpeechDetectedEvent {
 }
 
 // Helper to map backend speaker labels to a friendly badge
+// "local"/"remote" keep the fixed 你/对方 labels; any other string (e.g. a
+// diarized speaker name like "张三" imported from a desktop machine) is shown
+// verbatim so multi-speaker transcripts render their real names.
 function getSpeakerBadge(speaker: string | undefined): { icon: React.ReactNode; label: string; color: string } | null {
   if (!speaker) return null;
   switch (speaker) {
@@ -30,7 +33,7 @@ function getSpeakerBadge(speaker: string | undefined): { icon: React.ReactNode; 
     case 'remote':
       return { icon: <Monitor className="w-3 h-3" />, label: '对方', color: 'bg-emerald-100 text-emerald-700 border-emerald-200' };
     default:
-      return { icon: null, label: '未知', color: 'bg-gray-100 text-gray-600 border-gray-200' };
+      return { icon: <User className="w-3 h-3" />, label: speaker, color: 'bg-indigo-50 text-indigo-700 border-indigo-200' };
   }
 }
 

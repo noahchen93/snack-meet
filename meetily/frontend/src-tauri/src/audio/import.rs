@@ -589,9 +589,9 @@ async fn run_import<R: Runtime>(
                 .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
             (text, 0.9f32)
         } else {
-            let engine = whisper_engine.as_ref().unwrap();
+            let (engine, model_name) = whisper_engine.as_ref().unwrap();
             let (text, conf, _) = engine
-                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
+                .transcribe_audio_with_model(segment.samples.clone(), model_name, language.clone())
                 .await
                 .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
             (text, conf)
@@ -660,6 +660,7 @@ async fn run_import<R: Runtime>(
         &title,
         &segments,
         meeting_folder.to_string_lossy().to_string(),
+        false,
     )
     .await?;
 
@@ -703,12 +704,69 @@ fn emit_progress<R: Runtime>(app: &AppHandle<R>, stage: &str, progress: u32, mes
     );
 }
 
+/// Replace an existing meeting's transcripts in the database (used when a
+/// same-named folder's transcripts.json has been re-transcribed and re-synced).
+/// Deletes the old segments and inserts the new ones in one transaction.
+async fn update_meeting_transcripts(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    segments: &[TranscriptSegment],
+) -> Result<()> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| anyhow!("DB error: {}", e))?;
+    let mut tx = sqlx::Connection::begin(&mut *conn)
+        .await
+        .map_err(|e| anyhow!("Failed to start transaction: {}", e))?;
+
+    sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
+
+    for segment in segments {
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&segment.id)
+        .bind(meeting_id)
+        .bind(&segment.text)
+        .bind(&segment.timestamp)
+        .bind(segment.audio_start_time)
+        .bind(segment.audio_end_time)
+        .bind(segment.duration)
+        .bind(&segment.speaker)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
+    }
+
+    // Bump the meeting's updated_at so it bubbles to the top of the list.
+    sqlx::query("UPDATE meetings SET updated_at = ? WHERE id = ?")
+        .bind(chrono::Utc::now())
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("Failed to update meeting timestamp: {}", e))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
+
+    info!("Updated meeting {} with {} transcripts", meeting_id, segments.len());
+    Ok(())
+}
+
 /// Create a new meeting with transcripts in the database
 async fn create_meeting_with_transcripts(
     pool: &sqlx::SqlitePool,
     title: &str,
     segments: &[TranscriptSegment],
     folder_path: String,
+    is_imported: bool,
 ) -> Result<String> {
     let meeting_id = format!("meeting-{}", Uuid::new_v4());
     let now = chrono::Utc::now();
@@ -724,14 +782,15 @@ async fn create_meeting_with_transcripts(
 
     // Insert meeting
     sqlx::query(
-        "INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO meetings (id, title, created_at, updated_at, folder_path, is_imported)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&meeting_id)
     .bind(title)
     .bind(now)
     .bind(now)
     .bind(&folder_path)
+    .bind(is_imported)
     .execute(&mut *tx)
     .await
     .map_err(|e| anyhow!("Failed to create meeting: {}", e))?;
@@ -768,11 +827,14 @@ async fn create_meeting_with_transcripts(
     Ok(meeting_id)
 }
 
-/// Get or initialize the Whisper engine
+/// Get or initialize the Whisper engine.
+/// Returns the engine AND the loaded model name so callers can transcribe with an
+/// explicit model (transcribe_audio_with_model) instead of relying on the engine's
+/// "current" model, which the concurrent loader does not set.
 async fn get_or_init_whisper<R: Runtime>(
     app: &AppHandle<R>,
     requested_model: Option<&str>,
-) -> Result<Arc<WhisperEngine>> {
+) -> Result<(Arc<WhisperEngine>, String)> {
     use crate::whisper_engine::commands::WHISPER_ENGINE;
 
     let engine = {
@@ -803,7 +865,7 @@ async fn get_or_init_whisper<R: Runtime>(
                 info!("Whisper model '{}' already loaded concurrently", target_model);
             }
 
-            Ok(e)
+            Ok((e, target_model))
         }
         None => Err(anyhow!("Whisper engine not initialized")),
     }
@@ -1055,6 +1117,196 @@ pub async fn cancel_import_command() -> Result<(), String> {
 #[tauri::command]
 pub async fn is_import_in_progress_command() -> bool {
     is_import_in_progress()
+}
+
+/// Result of a scan-and-import operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanImportResult {
+    pub scanned: usize,
+    pub imported: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub imported_meetings: Vec<String>,
+}
+
+/// Parse a transcripts.json file (as written by Snack Meet's recording saver /
+/// retranscription / import) into api TranscriptSegments.
+///
+/// The on-disk format uses `display_time` for the human-readable timestamp and
+/// `sequence_id` for ordering; the DB TranscriptSegment uses `timestamp`. We map
+/// display_time -> timestamp so imported rows render correctly in the UI.
+fn parse_transcripts_json(path: &Path) -> Result<Vec<crate::api::TranscriptSegment>> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("Failed to read {}: {}", path.display(), e))?;
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| anyhow!("Failed to parse {}: {}", path.display(), e))?;
+
+    let segments = value
+        .get("segments")
+        .and_then(|s| s.as_array())
+        .ok_or_else(|| anyhow!("No 'segments' array in {}", path.display()))?;
+
+    let mut out = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let text = seg
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let display_time = seg
+            .get("display_time")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let audio_start_time = seg.get("audio_start_time").and_then(|v| v.as_f64());
+        let audio_end_time = seg.get("audio_end_time").and_then(|v| v.as_f64());
+        let duration = seg.get("duration").and_then(|v| v.as_f64());
+        let speaker = seg.get("speaker").and_then(|v| v.as_str()).map(|s| s.to_string());
+        // transcripts.id is a PRIMARY KEY. On-disk files often use generic ids
+        // like "seg_0"/"seg_1" that collide across meetings (and with existing
+        // rows), which makes the INSERT fail and rolls back the whole meeting.
+        // So for generic "seg_*" ids, mint a fresh UUID to guarantee uniqueness.
+        let raw_id = seg
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let id = match raw_id {
+            Some(s) if s.starts_with("seg_") => format!("transcript-{}", Uuid::new_v4()),
+            Some(s) => s,
+            None => format!("transcript-{}", Uuid::new_v4()),
+        };
+
+        out.push(crate::api::TranscriptSegment {
+            id,
+            text,
+            timestamp: display_time,
+            audio_start_time,
+            audio_end_time,
+            duration,
+            speaker,
+        });
+    }
+
+    Ok(out)
+}
+
+/// Scan a folder (e.g. the Baidu Netdisk sync space) for meeting subfolders that
+/// contain a transcripts.json, and import any that are not already in the database.
+///
+/// This is the bridge for the "desktop machine transcribes, this Mac displays"
+/// workflow: the desktop program writes transcripts.json into the synced folder,
+/// and this command imports them into Snack Meet's local DB so they appear in the
+/// meeting list and transcript view.
+#[tauri::command]
+pub async fn scan_and_import_transcripts(
+    app: AppHandle,
+    folder_path: String,
+) -> Result<ScanImportResult, String> {
+    let root = PathBuf::from(&folder_path);
+    if !root.exists() || !root.is_dir() {
+        return Err(format!("Folder not found: {}", folder_path));
+    }
+
+    let app_state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "App state not available".to_string())?;
+    let pool = app_state.db_manager.pool().clone();
+
+    // Collect existing folder_path -> meeting_id so we can update a same-named
+    // folder's transcripts instead of skipping it (re-transcription support).
+    let existing_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT folder_path, id FROM meetings WHERE folder_path IS NOT NULL",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| format!("Failed to query existing meetings: {}", e))?;
+    let mut existing: std::collections::HashMap<String, String> =
+        existing_rows.into_iter().collect();
+
+    let mut result = ScanImportResult {
+        scanned: 0,
+        imported: 0,
+        updated: 0,
+        skipped: 0,
+        failed: 0,
+        imported_meetings: Vec::new(),
+    };
+
+    let entries = std::fs::read_dir(&root)
+        .map_err(|e| format!("Failed to read folder {}: {}", folder_path, e))?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        result.scanned += 1;
+
+        let transcript_path = path.join("transcripts.json");
+        if !transcript_path.exists() {
+            result.skipped += 1;
+            continue;
+        }
+
+        let folder_path_str = path.to_string_lossy().to_string();
+
+        // Derive a title from the folder name (strip any trailing timestamp).
+        let title = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Imported Meeting")
+            .to_string();
+
+        match parse_transcripts_json(&transcript_path) {
+            Ok(segments) => {
+                if segments.is_empty() {
+                    result.skipped += 1;
+                    continue;
+                }
+                // If this folder already maps to a meeting in the DB, update its
+                // transcripts (supports re-transcription with an unchanged name).
+                // Otherwise, create a new meeting.
+                if let Some(meeting_id) = existing.get(&folder_path_str).cloned() {
+                    match update_meeting_transcripts(&pool, &meeting_id, &segments).await {
+                        Ok(()) => {
+                            result.updated += 1;
+                            result.imported_meetings.push(meeting_id);
+                        }
+                        Err(e) => {
+                            error!("Failed to update {}: {}", path.display(), e);
+                            result.failed += 1;
+                        }
+                    }
+                } else {
+                    match create_meeting_with_transcripts(&pool, &title, &segments, folder_path_str.clone(), true)
+                        .await
+                    {
+                        Ok(meeting_id) => {
+                            result.imported += 1;
+                            result.imported_meetings.push(meeting_id.clone());
+                            existing.insert(folder_path_str, meeting_id);
+                        }
+                        Err(e) => {
+                            error!("Failed to import {}: {}", path.display(), e);
+                            result.failed += 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Skipping {} (parse error): {}", path.display(), e);
+                result.failed += 1;
+            }
+        }
+    }
+
+    info!(
+        "Scan-and-import complete: scanned={}, imported={}, updated={}, skipped={}, failed={}",
+        result.scanned, result.imported, result.updated, result.skipped, result.failed
+    );
+
+    Ok(result)
 }
 
 #[cfg(test)]

@@ -643,8 +643,8 @@ pub async fn api_get_transcript_config<R: Runtime>(
         Ok(None) => {
             log_info!("No transcript config found, returning default.");
             Ok(Some(TranscriptConfig {
-                provider: "parakeet".to_string(),
-                model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
+                provider: "localWhisper".to_string(),
+                model: crate::config::DEFAULT_WHISPER_MODEL.to_string(),
                 api_key: None,
             }))
         }
@@ -787,6 +787,163 @@ pub async fn api_delete_meeting<R: Runtime>(
 }
 
 #[tauri::command]
+pub async fn api_delete_meeting_with_files<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<serde_json::Value, String> {
+    log_info!(
+        "api_delete_meeting_with_files called for meeting_id: {}",
+        meeting_id
+    );
+
+    let pool = state.db_manager.pool();
+
+    // 1. Look up the meeting's folder_path so we can delete the files too.
+    let folder_path: Option<String> = sqlx::query_scalar(
+        "SELECT folder_path FROM meetings WHERE id = ?",
+    )
+    .bind(&meeting_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to query meeting folder_path: {}", e))?;
+
+    // 2. Delete the database record (meeting + transcripts via cascade).
+    match MeetingsRepository::delete_meeting(pool, &meeting_id).await {
+        Ok(true) => {
+            log_info!("Successfully deleted meeting {}", meeting_id);
+        }
+        Ok(false) => {
+            return Err(format!(
+                "Meeting not found or could not be deleted: {}",
+                meeting_id
+            ))
+        }
+        Err(e) => {
+            return Err(format!("Failed to delete meeting: {}", e));
+        }
+    }
+
+    // 3. Delete the on-disk folder (audio files + transcripts.json) if present.
+    let mut deleted_folder = false;
+    if let Some(folder) = folder_path {
+        if !folder.trim().is_empty() {
+            let path = std::path::Path::new(&folder);
+            if path.exists() {
+                // Safety: only delete directories. Never follow symlinks.
+                if path.is_symlink() {
+                    log_warn!("Refusing to delete symlink: {}", folder);
+                } else if path.is_dir() {
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(_) => {
+                            deleted_folder = true;
+                            log_info!("Deleted meeting folder: {}", folder);
+                        }
+                        Err(e) => {
+                            log_error!("Failed to delete meeting folder {}: {}", folder, e);
+                            return Err(format!(
+                                "Meeting deleted from database but failed to delete folder {}: {}",
+                                folder, e
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "status": "success",
+        "message": "Meeting and associated files deleted successfully",
+        "deleted_folder": deleted_folder
+    }))
+}
+
+#[tauri::command]
+pub async fn api_delete_meetings<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    meeting_ids: Vec<String>,
+    delete_files: bool,
+) -> Result<serde_json::Value, String> {
+    log_info!(
+        "api_delete_meetings called for {} meetings, delete_files: {}",
+        meeting_ids.len(),
+        delete_files
+    );
+
+    let pool = state.db_manager.pool();
+
+    // Collect folder_paths for all meetings first (so we can delete files).
+    let mut folders_to_delete: Vec<String> = Vec::new();
+    if delete_files {
+        for id in &meeting_ids {
+            let folder_path: Option<String> = sqlx::query_scalar(
+                "SELECT folder_path FROM meetings WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("Failed to query meeting folder_path: {}", e))?;
+            if let Some(f) = folder_path {
+                if !f.trim().is_empty() {
+                    folders_to_delete.push(f);
+                }
+            }
+        }
+    }
+
+    // Delete each meeting from the database.
+    let mut deleted = 0usize;
+    for id in &meeting_ids {
+        match MeetingsRepository::delete_meeting(pool, id).await {
+            Ok(true) => {
+                deleted += 1;
+            }
+            Ok(false) => {
+                log_warn!("Meeting not found or already deleted: {}", id);
+            }
+            Err(e) => {
+                log_error!("Error deleting meeting {}: {}", id, e);
+                return Err(format!("Failed to delete meeting {}: {}", id, e));
+            }
+        }
+    }
+
+    // Delete the on-disk folders (audio + transcripts.json) if requested.
+    let mut deleted_folders = 0usize;
+    for folder in &folders_to_delete {
+        let path = std::path::Path::new(folder);
+        if path.exists() {
+            if path.is_symlink() {
+                log_warn!("Refusing to delete symlink: {}", folder);
+            } else if path.is_dir() {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(_) => {
+                        deleted_folders += 1;
+                        log_info!("Deleted meeting folder: {}", folder);
+                    }
+                    Err(e) => {
+                        log_error!("Failed to delete meeting folder {}: {}", folder, e);
+                        return Err(format!(
+                            "Meetings deleted from database but failed to delete folder {}: {}",
+                            folder, e
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "status": "success",
+        "message": format!("Deleted {} meetings successfully", deleted),
+        "deleted": deleted,
+        "deleted_folders": deleted_folders
+    }))
+}
+
+#[tauri::command]
 pub async fn api_get_meeting<R: Runtime>(
     _app: AppHandle<R>,
     meeting_id: String,
@@ -851,6 +1008,22 @@ pub async fn api_get_meeting_metadata<R: Runtime>(
             Err(format!("Failed to retrieve meeting metadata: {}", e))
         }
     }
+}
+
+/// Mark a meeting as read (clears the "new import" red dot).
+#[tauri::command]
+pub async fn api_mark_meeting_read<R: Runtime>(
+    _app: AppHandle<R>,
+    meeting_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    sqlx::query("UPDATE meetings SET is_read = 1 WHERE id = ?")
+        .bind(&meeting_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to mark meeting read: {}", e))?;
+    Ok(())
 }
 
 /// Get paginated transcripts for a meeting
@@ -1038,7 +1211,7 @@ pub async fn open_meeting_folder<R: Runtime>(
 
     // Get meeting with folder_path
     let meeting: Option<MeetingModel> = sqlx::query_as(
-        "SELECT id, title, created_at, updated_at, folder_path FROM meetings WHERE id = ?",
+        "SELECT id, title, created_at, updated_at, folder_path, is_imported, is_read FROM meetings WHERE id = ?",
     )
     .bind(&meeting_id)
     .fetch_optional(pool)

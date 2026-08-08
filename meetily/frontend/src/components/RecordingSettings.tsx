@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Switch } from '@/components/ui/switch';
-import { FolderOpen } from 'lucide-react';
+import { FolderOpen, RefreshCw } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { DeviceSelection, SelectedDevices } from '@/components/DeviceSelection';
 import Analytics from '@/lib/analytics';
@@ -144,6 +144,47 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     }
   };
 
+  const [scanning, setScanning] = useState(false);
+
+  // Scan the recordings folder for meeting subfolders that contain a
+  // transcripts.json (e.g. written by a desktop machine that transcribed the
+  // synced audio) and import any that aren't already in the local database.
+  const handleScanImport = async () => {
+    if (scanning) return;
+    setScanning(true);
+    try {
+      const result = await invoke<{
+        scanned: number;
+        imported: number;
+        updated: number;
+        skipped: number;
+        failed: number;
+        imported_meetings: string[];
+      }>('scan_and_import_transcripts', { folderPath: preferences.save_folder });
+      if (result.imported > 0 || result.updated > 0) {
+        toast.success(`已导入 ${result.imported} 个、更新 ${result.updated} 个会议`, {
+          description: `扫描 ${result.scanned} 个文件夹，跳过 ${result.skipped} 个，失败 ${result.failed} 个。`,
+        });
+      } else {
+        toast.info('没有新的转写可导入', {
+          description: `扫描 ${result.scanned} 个文件夹，跳过 ${result.skipped} 个，失败 ${result.failed} 个。`,
+        });
+      }
+      await Analytics.track('scan_import_transcripts', {
+        scanned: result.scanned.toString(),
+        imported: result.imported.toString(),
+        failed: result.failed.toString(),
+      });
+    } catch (error) {
+      console.error('Failed to scan and import transcripts:', error);
+      toast.error('扫描导入失败', {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setScanning(false);
+    }
+  };
+
   const handleNotificationToggle = async (enabled: boolean) => {
     try {
       setShowRecordingNotification(enabled);
@@ -231,6 +272,18 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
               <FolderOpen className="w-4 h-4" />
               Open Folder
             </button>
+            <button
+              onClick={handleScanImport}
+              disabled={scanning}
+              className="flex items-center gap-2 px-3 py-2 text-sm border border-blue-300 text-blue-700 rounded-md hover:bg-blue-50 transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`w-4 h-4 ${scanning ? 'animate-spin' : ''}`} />
+              {scanning ? '扫描中…' : '扫描并导入转写'}
+            </button>
+            <p className="text-xs text-gray-500 mt-2">
+              扫描此文件夹下含 transcripts.json 的会议子文件夹（例如台式机转写后同步过来的），
+              导入到本地会议列表。
+            </p>
           </div>
 
           <div className="p-4 border rounded-lg bg-blue-50">
