@@ -11,6 +11,14 @@ import { recordingService } from '@/services/recordingService';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { meetingNameFromDetection } from '@/lib/smartMeetingName';
 
+// Tauri event listeners can briefly overlap during a webview reload or React
+// remount. Keep the start-dialog guard at module scope so duplicate provider
+// instances cannot show multiple native prompts for the same detection event.
+let globalDialogInProgress = false;
+let lastDetectedKey = '';
+let lastDetectedAt = 0;
+const DETECTION_DEDUPE_MS = 5_000;
+
 /**
  * MeetingDetectorProvider
  *
@@ -28,9 +36,8 @@ import { meetingNameFromDetection } from '@/lib/smartMeetingName';
  *              so useRecordingStop auto-summarizes (→ smart folder rename) on save.
  *
  *   meeting-ended { reason: "app-exit" | "window-gone", bundle_id }
- *     → app-exit: auto-stop.
- *     → window-gone: native dialog "检测到会议结束，是否停止录音？" → on OK stop,
- *       on dismiss keep recording (matches Snack Record's showStopReminder).
+ *     → stop and save automatically. The Rust detector debounces a missing
+ *       meeting window before emitting the window-gone event.
  *
  * On stop it reuses the proven in-app-button path: invoke `stop_recording` (which
  * emits `recording-stopped` → useRecordingStop sets the sessionStorage
@@ -114,11 +121,23 @@ export function MeetingDetectorProvider({ children }: { children: React.ReactNod
   useEffect(() => {
     let unlistenDetected: (() => void) | undefined;
     let unlistenEnded: (() => void) | undefined;
+    let disposed = false;
 
     const setup = async () => {
-      unlistenDetected = await listen<MeetingDetectedPayload>('meeting-detected', async (event) => {
+      const detectedListener = await listen<MeetingDetectedPayload>('meeting-detected', async (event) => {
+        if (disposed) return;
         const { app_name, bundle_id, window_title, trigger } = event.payload;
-        if (dialogInProgress.current || (await isCurrentlyRecording())) return;
+        const detectionKey = `${bundle_id}:${trigger}:${window_title}`;
+        const now = Date.now();
+        if (
+          dialogInProgress.current
+          || globalDialogInProgress
+          || (now - lastDetectedAt < DETECTION_DEDUPE_MS && detectionKey === lastDetectedKey)
+          || (await isCurrentlyRecording())
+        ) return;
+        lastDetectedKey = detectionKey;
+        lastDetectedAt = now;
+        globalDialogInProgress = true;
         dialogInProgress.current = true;
         try {
           // Make sure the configured transcription provider actually has a usable
@@ -170,34 +189,31 @@ export function MeetingDetectorProvider({ children }: { children: React.ReactNod
           toast.error('自动录音启动失败', { description: e instanceof Error ? e.message : String(e) });
         } finally {
           dialogInProgress.current = false;
+          globalDialogInProgress = false;
         }
       });
+      if (disposed) {
+        detectedListener();
+        return;
+      }
+      unlistenDetected = detectedListener;
 
-      unlistenEnded = await listen<MeetingEndedPayload>('meeting-ended', async (event) => {
+      const endedListener = await listen<MeetingEndedPayload>('meeting-ended', async (event) => {
+        if (disposed) return;
         const { reason, bundle_id } = event.payload;
         if (!(await isCurrentlyRecording())) return;
-        if (reason === 'app-exit') {
-          // App fully exited → stop without asking (matches Snack Record).
+        if (reason === 'app-exit' || reason === 'window-gone') {
+          // App fully exited or the meeting window stayed gone long enough to
+          // confirm an end → stop and save without an extra confirmation.
           await stopAndSave(bundle_id);
           return;
         }
-        // window-gone: ask before stopping; dismiss = keep recording.
-        if (dialogInProgress.current) return;
-        dialogInProgress.current = true;
-        try {
-          const ok = await confirm('检测到会议结束，是否停止录音？', {
-            title: 'Snack Meet',
-            kind: 'warning',
-            okLabel: '停止录音',
-            cancelLabel: '继续录音',
-          });
-          if (ok) {
-            await stopAndSave(bundle_id);
-          }
-        } finally {
-          dialogInProgress.current = false;
-        }
       });
+      if (disposed) {
+        endedListener();
+        return;
+      }
+      unlistenEnded = endedListener;
 
       // Tauri events are not retained for listeners that have not mounted yet.
       // Tell Rust it may emit only after both handlers above are active, and force
@@ -210,6 +226,10 @@ export function MeetingDetectorProvider({ children }: { children: React.ReactNod
     });
 
     return () => {
+      // Mark the async setup as disposed before invoking the listeners we have
+      // already acquired. If listen() resolves after cleanup, setup() will
+      // immediately unregister that late listener instead of leaking it.
+      disposed = true;
       unlistenDetected?.();
       unlistenEnded?.();
     };

@@ -282,14 +282,14 @@ export function useRecordingStop(
           // after the recording is saved (independent of the summary flow) and
           // update the meeting name + folder. Runs in the background so it never
           // blocks saving/navigation.
-          invoke<string | null>('copilot_smart_rename_meeting', { meetingId })
+          invoke<string | null>('smart_rename_meeting', { meetingId })
             .then((newTitle: string | null) => {
               if (newTitle) {
                 console.log('[Snack Meet] Smart-renamed meeting:', newTitle);
                 setCurrentMeeting({ id: meetingId, title: newTitle });
               }
             })
-            .catch((e) => console.warn('[Snack Meet] copilot_smart_rename_meeting failed:', e));
+            .catch((e) => console.warn('[Snack Meet] smart_rename_meeting failed:', e));
 
           let shouldDetectSummaryLanguage = false;
           try {

@@ -265,7 +265,12 @@ export function SettingsModals({
             <TranscriptSettings
               transcriptModelConfig={transcriptModelConfig}
               setTranscriptModelConfig={setTranscriptModelConfig}
-              onModelSelect={() => onClose('modelSelector')}
+              onModelSelect={() => {
+                onClose('modelSelector');
+                // ModelManager persists the selection asynchronously after the
+                // callback, so wait briefly before re-checking backend readiness.
+                window.setTimeout(() => window.dispatchEvent(new Event('retry-recording-start')), 500);
+              }}
             />
           </div>
 
