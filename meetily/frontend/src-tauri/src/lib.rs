@@ -96,7 +96,7 @@ fn scan_time_window(prefs: &audio::recording_preferences::RecordingPreferences) 
             let start = now
                 .date_naive()
                 .and_hms_opt(0, 0, 0)
-                .and_then(|naive| chrono::DateTime::<Utc>::from_utc(naive, Utc).to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into());
+                .and_then(|naive| naive.and_utc().to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into());
             let end = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             (start, Some(end))
         }

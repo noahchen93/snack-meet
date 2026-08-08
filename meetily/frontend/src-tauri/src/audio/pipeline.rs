@@ -974,14 +974,26 @@ impl AudioPipeline {
                                 }
                             }
 
-                            // STEP 4: Send mixed audio for recording (WAV file)
+                            // STEP 4: Send audio for recording. We save a STEREO file
+                            // (left = microphone, right = system audio) so the desktop
+                            // machine can split the channels offline for precise
+                            // speaker diarization, without any extra disk space.
                             if let Some(ref sender) = self.recording_sender_for_mixed {
+                                // Interleave mic (left) and system (right).
+                                let max_len = mic_window.len().max(sys_window.len());
+                                let mut stereo: Vec<f32> = Vec::with_capacity(max_len * 2);
+                                for i in 0..max_len {
+                                    let mic = mic_window.get(i).copied().unwrap_or(0.0);
+                                    let sys = sys_window.get(i).copied().unwrap_or(0.0);
+                                    stereo.push(mic);
+                                    stereo.push(sys);
+                                }
                                 let recording_chunk = AudioChunk {
-                                    data: mixed_with_gain.clone(),
+                                    data: stereo,
                                     sample_rate: self.sample_rate,
                                     timestamp: chunk.timestamp,
                                     chunk_id: self.chunk_id_counter,
-                                    device_type: DeviceType::Microphone, // Mixed audio
+                                    device_type: DeviceType::Microphone, // Stereo: L=mic, R=system
                                 };
                                 let _ = sender.send(recording_chunk);
                             }

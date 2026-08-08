@@ -95,10 +95,12 @@ impl IncrementalAudioSaver {
             .join(format!("audio_chunk_{:03}.mp4", self.checkpoint_count));
 
         // Encode and save checkpoint
+        // Channel count is 2: the pipeline sends interleaved stereo
+        // (L = microphone, R = system audio) for offline diarization.
         encode_single_audio(
             bytemuck::cast_slice(&audio_data),
             self.sample_rate,
-            1, // mono
+            2, // stereo (L=mic, R=system)
             &checkpoint_path,
         )?;
 
