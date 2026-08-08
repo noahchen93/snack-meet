@@ -8,6 +8,7 @@ use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -661,6 +662,7 @@ async fn run_import<R: Runtime>(
         &segments,
         meeting_folder.to_string_lossy().to_string(),
         false,
+        None,
     )
     .await?;
 
@@ -702,6 +704,19 @@ fn emit_progress<R: Runtime>(app: &AppHandle<R>, stage: &str, progress: u32, mes
             message: message.to_string(),
         },
     );
+}
+
+/// Read the recording's creation time from a meeting folder's metadata.json
+/// (if present). Used so imported meetings sort by when the call actually
+/// happened instead of by when they were imported.
+fn read_recording_created_at(folder: &Path) -> Option<chrono::DateTime<Utc>> {
+    let meta_path = folder.join("metadata.json");
+    let contents = std::fs::read_to_string(&meta_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    let created = json.get("created_at")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(created)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Replace an existing meeting's transcripts in the database (used when a
@@ -767,8 +782,14 @@ async fn create_meeting_with_transcripts(
     segments: &[TranscriptSegment],
     folder_path: String,
     is_imported: bool,
+    created_at: Option<chrono::DateTime<Utc>>,
 ) -> Result<String> {
     let meeting_id = format!("meeting-{}", Uuid::new_v4());
+    let now = chrono::Utc::now();
+    // Use the recording's actual creation time (from metadata.json) when
+    // provided, so meetings sort by when the call actually happened rather
+    // than by when they were imported. Fall back to "now".
+    let effective_created_at = created_at.unwrap_or(now);
     let now = chrono::Utc::now();
 
     // Start transaction
@@ -787,7 +808,7 @@ async fn create_meeting_with_transcripts(
     )
     .bind(&meeting_id)
     .bind(title)
-    .bind(now)
+    .bind(effective_created_at)
     .bind(now)
     .bind(&folder_path)
     .bind(is_imported)
@@ -1268,6 +1289,17 @@ pub async fn scan_and_import_transcripts(
                 // transcripts (supports re-transcription with an unchanged name).
                 // Otherwise, create a new meeting.
                 if let Some(meeting_id) = existing.get(&folder_path_str).cloned() {
+                    // Backfill the recording's actual creation time (from
+                    // metadata.json) so previously-imported meetings also sort
+                    // by when the call happened, not when they were imported.
+                    if let Some(rec_created_at) = read_recording_created_at(&path) {
+                        let _ = sqlx::query("UPDATE meetings SET created_at = ? WHERE id = ? AND created_at > ?")
+                            .bind(rec_created_at)
+                            .bind(&meeting_id)
+                            .bind(rec_created_at)
+                            .execute(&pool)
+                            .await;
+                    }
                     match update_meeting_transcripts(&pool, &meeting_id, &segments).await {
                         Ok(()) => {
                             result.updated += 1;
@@ -1279,7 +1311,8 @@ pub async fn scan_and_import_transcripts(
                         }
                     }
                 } else {
-                    match create_meeting_with_transcripts(&pool, &title, &segments, folder_path_str.clone(), true)
+                    let recording_created_at = read_recording_created_at(&path);
+                    match create_meeting_with_transcripts(&pool, &title, &segments, folder_path_str.clone(), true, recording_created_at)
                         .await
                     {
                         Ok(meeting_id) => {

@@ -213,8 +213,53 @@ export function HomeDashboard() {
   };
 
   // Most recent first (backend already orders by created_at DESC)
-  const recent = meetings.slice(0, 8);
+  const recent = meetings.slice(0, 12);
   const allSelected = recent.length > 0 && selected.size === recent.length;
+
+  // Group meetings by their recording date (day label). Used to render the
+  // list partitioned by day, like a downloads folder (今天/昨天/具体日期).
+  function groupByDay(list: HomeMeeting[]): Array<{ label: string; key: string; meetings: HomeMeeting[] }> {
+    const groups: Array<{ label: string; key: string; meetings: HomeMeeting[] }> = [];
+    const seen = new Map<string, number>();
+    for (const m of list) {
+      const key = dayKey(m.createdAt);
+      const idx = seen.get(key);
+      if (idx === undefined) {
+        seen.set(key, groups.length);
+        groups.push({ key, label: dayLabel(m.createdAt), meetings: [m] });
+      } else {
+        groups[idx].meetings.push(m);
+      }
+    }
+    return groups;
+  }
+
+  function dayKey(iso?: string): string {
+    if (!iso) return 'unknown';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return 'unknown';
+    return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+  }
+
+  function dayLabel(iso?: string): string {
+    if (!iso) return '其他日期';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return '其他日期';
+    const now = new Date();
+    const isToday = d.toDateString() === now.toDateString();
+    const yesterday = new Date(now);
+    yesterday.setDate(now.getDate() - 1);
+    const isYesterday = d.toDateString() === yesterday.toDateString();
+    if (isToday) return '今天';
+    if (isYesterday) return '昨天';
+    const weekday = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][d.getDay()];
+    if (d.getFullYear() === now.getFullYear()) {
+      return `${d.getMonth() + 1}月${d.getDate()}日 ${weekday}`;
+    }
+    return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 ${weekday}`;
+  }
+
+  const grouped = groupByDay(recent);
 
   return (
     <div className="w-full max-w-5xl mx-auto px-6 py-6">
@@ -274,89 +319,102 @@ export function HomeDashboard() {
             )}
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {recent.map((meeting) => {
-              const isSelected = selected.has(meeting.id);
-              return (
-                <div
-                  key={meeting.id}
-                  className={`group relative text-left rounded-xl border bg-white p-4 transition-all hover:shadow-md ${
-                    isSelected ? 'border-indigo-400 ring-2 ring-indigo-200' : 'border-gray-200 hover:border-indigo-300'
-                  }`}
-                >
-                  {/* Selection checkbox */}
-                  <div
-                    className="absolute top-3 left-3 z-10"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      toggleSelect(meeting.id);
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={isSelected}
-                      onChange={() => toggleSelect(meeting.id)}
-                      className="w-4 h-4 text-indigo-600"
-                    />
-                  </div>
-
-                  {/* Card clickable area */}
-                  <div
-                    onClick={() => router.push(`/meeting-details?id=${meeting.id}`)}
-                    className="cursor-pointer"
-                  >
-                    <div className="flex items-start justify-between gap-2 pl-8">
-                      <div className="min-w-0 flex-1">
-                        <p className="text-sm font-medium text-gray-800 truncate group-hover:text-indigo-600 transition-colors">
-                          {meeting.title || '未命名会议'}
-                        </p>
-                        <p className="text-xs text-gray-400 mt-1 flex items-center gap-1">
-                          <Clock className="w-3 h-3" />
-                          {formatDate(meeting.createdAt)}
-                        </p>
-                      </div>
-                      <ChevronRight className="w-4 h-4 text-gray-300 group-hover:text-indigo-400 shrink-0 mt-1" />
-                    </div>
-                    <div className="flex items-center gap-1.5 mt-3">
-                      <span className="inline-flex items-center gap-1 rounded-md bg-gray-50 px-2 py-0.5 text-[10px] text-gray-500">
-                        <FileText className="w-3 h-3" />
-                        查看记录
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Dropdown menu */}
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <button
-                        onClick={(e) => e.stopPropagation()}
-                        className="absolute top-3 right-3 p-1.5 rounded-md text-gray-400 hover:bg-gray-100 hover:text-gray-700 z-10"
-                        aria-label="更多操作"
-                      >
-                        <MoreVertical className="w-4 h-4" />
-                      </button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end" className="w-44">
-                      <DropdownMenuItem onClick={() => startRename(meeting)}>
-                        <Pencil className="w-4 h-4 mr-2" /> 重命名
-                      </DropdownMenuItem>
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        className="text-red-600 focus:text-red-700"
-                        onClick={() => setDeleteTarget(meeting)}
-                      >
-                        <Trash2 className="w-4 h-4 mr-2" /> 删除
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
+          <div className="space-y-8">
+            {grouped.map((group) => (
+              <section key={group.key}>
+                {/* Day partition header */}
+                <div className="mb-3 flex items-center gap-3">
+                  <h2 className="text-sm font-semibold text-gray-700">{group.label}</h2>
+                  <div className="h-px flex-1 bg-gray-200"></div>
+                  <span className="text-xs text-gray-400">{group.meetings.length} 个会议</span>
                 </div>
-              );
-            })}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {group.meetings.map((meeting) => {
+                    const isSelected = selected.has(meeting.id);
+                    return (
+                      <div
+                        key={meeting.id}
+                        className={`group relative text-left rounded-xl border bg-white p-4 transition-all hover:shadow-md ${
+                          isSelected ? 'border-indigo-400 ring-2 ring-indigo-200' : 'border-gray-200 hover:border-indigo-300'
+                        }`}
+                      >
+                        {/* Selection checkbox */}
+                        <div
+                          className="absolute top-3 left-3 z-10"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleSelect(meeting.id);
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleSelect(meeting.id)}
+                            className="w-4 h-4 text-indigo-600"
+                          />
+                        </div>
+
+                        {/* Card clickable area */}
+                        <div
+                          onClick={() => router.push(`/meeting-details?id=${meeting.id}`)}
+                          className="cursor-pointer"
+                        >
+                          <div className="flex items-start justify-between gap-2 pl-8">
+                            <div className="min-w-0 flex-1">
+                              <p className="text-sm font-medium text-gray-800 truncate group-hover:text-indigo-600 transition-colors">
+                                {meeting.title || '未命名会议'}
+                              </p>
+                              <p className="text-xs text-gray-400 mt-1 flex items-center gap-1">
+                                <Clock className="w-3 h-3" />
+                                {formatDate(meeting.createdAt)}
+                              </p>
+                            </div>
+                            <ChevronRight className="w-4 h-4 text-gray-300 group-hover:text-indigo-400 shrink-0 mt-1" />
+                          </div>
+                          <div className="flex items-center gap-1.5 mt-3">
+                            <span className="inline-flex items-center gap-1 rounded-md bg-gray-50 px-2 py-0.5 text-[10px] text-gray-500">
+                              <FileText className="w-3 h-3" />
+                              查看记录
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Dropdown menu */}
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <button
+                              onClick={(e) => e.stopPropagation()}
+                              className="absolute top-3 right-3 p-1.5 rounded-md text-gray-400 hover:bg-gray-100 hover:text-gray-700 z-10"
+                              aria-label="更多操作"
+                            >
+                              <MoreVertical className="w-4 h-4" />
+                            </button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end" className="w-44">
+                            <DropdownMenuItem onClick={() => startRename(meeting)}>
+                              <Pencil className="w-4 h-4 mr-2" /> 重命名
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              className="text-red-600 focus:text-red-700"
+                              onClick={() => setDeleteTarget(meeting)}
+                            >
+                              <Trash2 className="w-4 h-4 mr-2" /> 删除
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            ))}
           </div>
         </div>
       )}
 
-      {recent.length > 8 && (
+      {recent.length > 12 && (
         <div className="mt-6 text-center">
           <button
             onClick={() => router.push('/')}
