@@ -70,9 +70,8 @@ function ConditionalImportDialog({
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
   const isRecordingOverlay = pathname.includes('recording-overlay')
-  const isAICopilot = pathname.includes('ai-copilot')
 
-  if (isRecordingOverlay || isAICopilot) {
+  if (isRecordingOverlay) {
     return (
       <html lang="zh-CN">
         <body className={`${sourceSans3.variable} bg-transparent font-sans antialiased`}>

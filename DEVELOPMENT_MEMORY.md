@@ -77,21 +77,14 @@ Snack Meet = **meetily**（Rust + Tauri + Next.js 主应用）+ 从 **Snack Reco
 - 前端 `MeetingDetectorProvider.tsx` 监听 `meeting-detected` / `meeting-ended`，驱动 start/stop/save
 
 ### 3. 智能重命名（中文标题）
-- `copilot_smart_rename_meeting`（copilot.rs）：保存后立即后台生成标题（独立于总结流程，总结失败也能重命名）
-- **强制中文**标题（3-12 字），复用 copilot 云端/LLM 配置
+- `smart_rename_meeting`（copilot.rs）：保存后立即后台生成标题（独立于总结流程，总结失败也能重命名）
+- **强制中文**标题（3-12 字），复用总结模块的 LLM 配置
 - 更新 DB 会议名 + 重命名录音文件夹（`SummaryService::rename_meeting_folder` 已 pub(crate)）
 - `extract_title_from_output`：从本地内置模型的"思考过程 + 候选标题"中提取最终标题（有单元测试）
 - 已在真实会议验证：121 段转写 → "交通执法展台位置与布局调整方案讨论"
 
-### 4. AI 会议副驾（实验功能）
-- 悬浮窗 `ai-copilot`：边录音边基于转写自动提醒（~45s）+ 手动随时提问
-- 提供背景资料（`copilot_context.md`）+ 云端模型配置（`copilot_cloud.json`：OpenAI 兼容 endpoint/model/key）
-- LLM 路由：云端配置优先，否则回退到总结 LLM 配置
-- 入口：tray 菜单"🧠 AI Copilot"、设置页 Copilot tab、录音悬浮窗 Bot 按钮
-- 关键文件：`copilot.rs`、`ai-copilot/page.tsx`、`CopilotSettings.tsx`
-
-### 5. 录音悬浮窗
-- `recording-overlay` 透明置顶窗口，含：Bot(AI副驾) → 暂停 → 停止 → 展开 按钮
+### 4. 录音悬浮窗
+- `recording-overlay` 透明置顶窗口，含：暂停 → 停止 → 展开按钮
 - **可拖拽**（需 `core:window:allow-start-dragging` 权限）
 
 ### 6. 首页仪表盘
@@ -129,17 +122,15 @@ Snack Meet = **meetily**（Rust + Tauri + Next.js 主应用）+ 从 **Snack Reco
 snack-meet/
 ├── meetily/frontend/src-tauri/src/
 │   ├── meeting_detector.rs          # 会议/语音检测状态机（poll、触发、权限）
-│   ├── copilot.rs                   # AI 副驾 + 智能重命名命令 + LLM 路由
+│   ├── copilot.rs                   # 智能重命名命令 + LLM 路由
 │   ├── audio/transcription/diarization.rs  # 说话人分离
 │   ├── summary/service.rs           # 总结 + rename_meeting_folder(pub(crate))
 │   ├── external_trigger.rs          # auto_summarize
 │   └── lib.rs                       # 命令注册
 ├── meetily/frontend/src/
 │   ├── app/recording-overlay/page.tsx   # 录音悬浮窗
-│   ├── app/ai-copilot/page.tsx          # AI 副驾悬浮窗
 │   ├── app/page.tsx                     # 首页
 │   ├── components/HomeDashboard.tsx     # 首页仪表盘
-│   ├── components/CopilotSettings.tsx   # 设置-Copilot
 │   ├── contexts/MeetingDetectorProvider.tsx
 │   ├── hooks/useRecordingStop.ts        # 保存后触发智能重命名
 │   └── lib/smartMeetingName.ts
@@ -152,10 +143,7 @@ snack-meet/
 
 - [x] 双通道录音（已完成，方案A：立体声 L=mic/R=system）
 - [ ] ~~真实会议全流程验证~~（用户确认不做）
-- [ ] **summary 完成后自动智能命名**：目前 `extract_meeting_name_from_markdown` 只简单提取 markdown 首个 `#` 标题（不可靠，可能得到英文/通用词如 "Technical Review of Logo Design"）。应基于 summary 内容用 LLM 生成中文标题（可复用 copilot 的 `generate_meeting_title`，但需解决 summary 模块→copilot 的循环依赖，可把标题生成抽到公共模块）
-- [ ] **AI 副驾自动提醒的触发频率/质量调优**（大问题，用户最后做）
 - [ ] 微信/WhatsApp 语音通话实测（需真实通话）
-- [ ] 悬浮窗 AI 副驾按钮与 copilot 窗口联调确认
 - [ ] 台式机端离线精确说话人分离：把新录音立体声拆 L=mic/R=system，用 pyannote 等精确 diarization，产出 speaker 名字写回 transcripts.json
 
 ### 7. 导出为 Markdown（新增）

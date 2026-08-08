@@ -5,7 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
 import { appDataDir } from '@tauri-apps/api/path';
 import { getCurrentWindow, Window } from '@tauri-apps/api/window';
-import { Bot, Mic2, Pause, Play, Radio, SquareArrowOutUpRight, Square } from 'lucide-react';
+import { Mic2, Pause, Play, Radio, SquareArrowOutUpRight, Square } from 'lucide-react';
 import type { RecordingState } from '@/services/recordingService';
 
 function formatDuration(seconds: number | null): string {
@@ -80,13 +80,6 @@ export default function RecordingOverlayPage() {
     await main?.setFocus();
   };
 
-  const openCopilot = async () => {
-    const copilot = await Window.getByLabel('ai-copilot');
-    if (!copilot) return;
-    await copilot.show();
-    await copilot.setFocus();
-  };
-
   const isPaused = !!state?.is_paused;
   return (
     <main className="h-screen w-screen select-none overflow-hidden bg-transparent p-2">
@@ -114,16 +107,6 @@ export default function RecordingOverlayPage() {
           </p>
         </div>
 
-        {!ended && (
-          <button
-            onClick={openCopilot}
-            className="flex h-8 w-8 items-center justify-center rounded-full border border-indigo-200 bg-indigo-50 text-indigo-600 transition hover:bg-indigo-100"
-            aria-label="打开 AI 副驾"
-            title="打开 AI 副驾"
-          >
-            <Bot size={14} />
-          </button>
-        )}
         {!ended && (
           <button
             onClick={togglePause}

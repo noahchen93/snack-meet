@@ -12,9 +12,8 @@
 //!   * `isOnScreen` is intentionally ignored for dedicated meeting apps (the 腾讯会议 fix):
 //!     SCShareableContent reports isOnScreen=0 mid-meeting for some apps. Home/launcher
 //!     windows are rejected by title + size instead.
-//!   * Confirmation dialogs are shown by the frontend (native Tauri dialog, visible above a
-//!     fullscreen meeting). Cooldowns (10 min after a start prompt, 120 s after a recording
-//!     ends) and the once-per-recording stop-prompt de-dupe are kept here, in the detector.
+//!   * Confirmation dialogs are shown by the frontend for starts. When an active
+//!     meeting window remains absent for several polls, recording stops automatically.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -30,8 +29,9 @@ use tracing::{info, warn};
 use crate::meeting_audio_probe::{self, AudioProbeHandle};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(800);
-const START_COOLDOWN: Duration = Duration::from_secs(600); // 10 min after a start prompt
-const STOP_COOLDOWN: Duration = Duration::from_secs(120); // after a recording ends
+const START_COOLDOWN: Duration = Duration::from_secs(600); // 10 min after a declined start prompt
+const STOP_COOLDOWN: Duration = Duration::from_secs(10); // short gap after a recording ends
+const MEETING_END_STABLE_POLLS: u8 = 5; // ~4 seconds of a missing meeting window
 const CANDIDATE_STABLE_POLLS: u8 = 1;
 const MICROPHONE_TRIGGER_POLLS: u8 = 1;
 const AUDIO_TRIGGER_MS: u64 = 1_000;
@@ -101,7 +101,7 @@ pub struct MeetingDetected {
 
 #[derive(Serialize, Clone)]
 pub struct MeetingEnded {
-    /// "app-exit" (auto-stop) or "window-gone" (ask before stopping)
+    /// "app-exit" or "window-gone"; both stop and save automatically.
     pub reason: String,
     pub bundle_id: Option<String>,
 }
@@ -115,6 +115,7 @@ pub struct MeetingDetector {
     pub recording_active: bool,
     pub recorded_bundle: Option<String>,
     pub stop_prompted_for_bundle: Option<String>,
+    meeting_end_polls: u8,
     pub cooldown_until: Option<Instant>,
     candidate_signature: Option<String>,
     candidate_stable_polls: u8,
@@ -236,6 +237,14 @@ fn window_suggests_meeting(bundle: &str, title: &str, width: f64, height: f64) -
     let feishu = bundle == "com.electron.lark" || bundle == "com.bytedance.ee.lark";
     if feishu {
         return false;
+    }
+    // Tencent Meeting keeps a large desktop-sized launcher window alive after
+    // a call ends. Its title can be empty or differ from the normal home title,
+    // so treating every large Tencent window as a meeting prevents auto-stop.
+    // The real in-meeting window is titled `TencentMeeting`; keyword titles are
+    // also accepted for localized variants.
+    if matches!(bundle, "com.tencent.meeting" | "com.tencent.wemeet") {
+        return title_lower.trim() == "tencentmeeting";
     }
     if is_dedicated(bundle) {
         // isOnScreen deliberately ignored (腾讯会议 reports 0 mid-meeting).
@@ -374,6 +383,7 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
             det.recording_active = false;
             det.recorded_bundle = None;
             det.stop_prompted_for_bundle = None;
+            det.meeting_end_polls = 0;
             det.cooldown_until = Some(Instant::now() + STOP_COOLDOWN);
             info!(
                 "meeting app exited; emitting meeting-ended(app-exit) bundle={}",
@@ -409,13 +419,23 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
         });
         let mut det = state.lock().await;
         if still_meeting {
-            // Window came back; allow a future stop prompt.
+            // Window came back; reset the end debounce.
             det.stop_prompted_for_bundle = None;
-        } else if det.stop_prompted_for_bundle.as_deref() != Some(rb.as_str()) {
-            // Window gone but app still running → ask once.
+            det.meeting_end_polls = 0;
+        } else {
+            det.meeting_end_polls = det.meeting_end_polls.saturating_add(1);
+        }
+        if !still_meeting
+            && det.meeting_end_polls >= MEETING_END_STABLE_POLLS
+            && det.stop_prompted_for_bundle.as_deref() != Some(rb.as_str())
+        {
+            // Window has been gone for several consecutive polls while the app
+            // stays open (for example Tencent Meeting returns to its home page).
+            // Treat that as the meeting ending and let the frontend save/stop.
             det.stop_prompted_for_bundle = Some(rb.clone());
             info!(
-                "meeting window no longer visible; emitting meeting-ended(window-gone) bundle={}",
+                "meeting window absent for {} polls; emitting meeting-ended(window-gone) bundle={}",
+                det.meeting_end_polls,
                 rb
             );
             let _ = app.emit(
@@ -698,11 +718,13 @@ pub async fn set_recording_active<R: Runtime>(
         }
         det.recorded_bundle = bundle_id;
         det.stop_prompted_for_bundle = None;
+        det.meeting_end_polls = 0;
         det.cooldown_until = None;
         det.cooldown_signature = None;
     } else {
         det.recorded_bundle = None;
         det.stop_prompted_for_bundle = None;
+        det.meeting_end_polls = 0;
         det.candidate_signature = None;
         det.candidate_stable_polls = 0;
         det.microphone_active_polls = 0;
