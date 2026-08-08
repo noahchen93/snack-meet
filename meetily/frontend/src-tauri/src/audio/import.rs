@@ -1223,11 +1223,36 @@ fn parse_transcripts_json(path: &Path) -> Result<Vec<crate::api::TranscriptSegme
 pub async fn scan_and_import_transcripts(
     app: AppHandle,
     folder_path: String,
+    // Optional time filter (RFC3339). When provided, only meeting subfolders
+    // whose recording was created within [start_time, end_time) are processed.
+    // Useful for "scan only today" or "scan a specific date range".
+    start_time: Option<String>,
+    end_time: Option<String>,
 ) -> Result<ScanImportResult, String> {
     let root = PathBuf::from(&folder_path);
     if !root.exists() || !root.is_dir() {
         return Err(format!("Folder not found: {}", folder_path));
     }
+
+    // Parse optional time window. If either is present, enforce it.
+    let window_start = match &start_time {
+        Some(s) if !s.trim().is_empty() => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| format!("Invalid start_time: {}", e))?
+                .with_timezone(&Utc),
+        ),
+        _ => None,
+    };
+    let window_end = match &end_time {
+        Some(s) if !s.trim().is_empty() => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| format!("Invalid end_time: {}", e))?
+                .with_timezone(&Utc),
+        ),
+        _ => None,
+    };
+    // Only apply time filtering if a window was actually provided.
+    let time_filtered = window_start.is_some() || window_end.is_some();
 
     let app_state = app
         .try_state::<AppState>()
@@ -1268,6 +1293,27 @@ pub async fn scan_and_import_transcripts(
         if !transcript_path.exists() {
             result.skipped += 1;
             continue;
+        }
+
+        // Apply time window filter (based on the recording's created_at from
+        // metadata.json) if a window was requested.
+        if time_filtered {
+            let rec_time = read_recording_created_at(&path);
+            let in_window = match rec_time {
+                Some(t) => {
+                    let after_start = window_start.map(|s| t >= s).unwrap_or(true);
+                    let before_end = window_end.map(|e| t < e).unwrap_or(true);
+                    after_start && before_end
+                }
+                // No metadata time available: include it only if no window bounds
+                // constrain the lower/upper side we can't determine. To be safe,
+                // skip folders we can't timestamp when a filter is active.
+                None => false,
+            };
+            if !in_window {
+                result.skipped += 1;
+                continue;
+            }
         }
 
         let folder_path_str = path.to_string_lossy().to_string();

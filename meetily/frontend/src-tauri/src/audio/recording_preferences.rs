@@ -27,6 +27,23 @@ pub struct RecordingPreferences {
     /// when a meeting app opens (the fused Snack Record detection feature).
     #[serde(default)]
     pub auto_detect_meetings: bool,
+    /// Whether to periodically auto-scan the recordings folder for new synced
+    /// transcripts.json files (in addition to the one-time scan on launch).
+    #[serde(default)]
+    pub auto_scan_enabled: bool,
+    /// Auto-scan interval in minutes (default 60). Only used when
+    /// auto_scan_enabled is true.
+    #[serde(default)]
+    pub auto_scan_interval_minutes: Option<u64>,
+    /// Auto-scan time filter mode: "all" (scan everything), "today" (only
+    /// recordings created today), or "custom" (respect auto_scan_start/end).
+    #[serde(default)]
+    pub auto_scan_mode: Option<String>,
+    /// Custom time range for auto_scan_mode == "custom" (RFC3339).
+    #[serde(default)]
+    pub auto_scan_start: Option<String>,
+    #[serde(default)]
+    pub auto_scan_end: Option<String>,
 }
 
 impl Default for RecordingPreferences {
@@ -40,6 +57,11 @@ impl Default for RecordingPreferences {
             #[cfg(target_os = "macos")]
             system_audio_backend: Some("coreaudio".to_string()),
             auto_detect_meetings: false,
+            auto_scan_enabled: false,
+            auto_scan_interval_minutes: Some(60),
+            auto_scan_mode: Some("all".to_string()),
+            auto_scan_start: None,
+            auto_scan_end: None,
         }
     }
 }
@@ -246,6 +268,57 @@ pub async fn open_recordings_folder<R: Runtime>(app: AppHandle<R>) -> Result<(),
 
     info!("Opened recordings folder: {}", folder_path);
     Ok(())
+}
+
+/// Open a native folder picker so the user can manually choose the recordings
+/// storage location. If a folder is picked, it is saved as the new save_folder
+/// (replacing the default) and returned. The default location stays unchanged
+/// until the user explicitly picks a new one.
+#[tauri::command]
+pub async fn pick_and_set_recording_folder<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    // The native folder picker is callback-based. Use a channel to wait for
+    // the user's choice (pick a folder or cancel) inside this async command.
+    let (tx, rx) = std::sync::mpsc::channel::<Option<tauri_plugin_dialog::FilePath>>();
+    app.dialog()
+        .file()
+        .set_title("选择录音文件存储位置")
+        .pick_folder(move |folder: Option<tauri_plugin_dialog::FilePath>| {
+            let _ = tx.send(folder);
+        });
+
+    // Block until the user closes the picker.
+    let picked = rx
+        .recv()
+        .map_err(|e| format!("Folder picker failed: {}", e))?;
+
+    let Some(folder) = picked else {
+        info!("Folder picker cancelled by user");
+        return Ok(None);
+    };
+
+    let path = folder
+        .into_path()
+        .map_err(|e| format!("Failed to resolve picked folder: {}", e))?;
+    let path_str = path.to_string_lossy().to_string();
+    if path_str.trim().is_empty() {
+        return Ok(None);
+    }
+
+    // Load current prefs, update save_folder, and persist.
+    let mut prefs = load_recording_preferences(&app)
+        .await
+        .map_err(|e| format!("Failed to load preferences: {}", e))?;
+    prefs.save_folder = PathBuf::from(&path_str);
+    save_recording_preferences(&app, &prefs)
+        .await
+        .map_err(|e| format!("Failed to save preferences: {}", e))?;
+
+    info!("Recording storage location changed to: {}", path_str);
+    Ok(Some(path_str))
 }
 
 #[tauri::command]

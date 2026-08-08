@@ -1,5 +1,7 @@
 "use client";
 import { useState, useEffect, useRef } from 'react';
+import { useRouter } from 'next/navigation';
+import { ArrowLeft } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { Summary, SummaryResponse } from '@/types';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -64,6 +66,7 @@ export default function PageContent({
 
   // Sidebar context
   const { serverAddress } = useSidebar();
+  const router = useRouter();
 
   // Get model config from ConfigContext
   const { modelConfig, setModelConfig } = useConfig();
@@ -179,6 +182,20 @@ export default function PageContent({
       transition={{ duration: 0.3, ease: 'easeOut' }}
       className="flex flex-col h-screen bg-gray-50"
     >
+      {/* Back to home bar */}
+      <div className="flex items-center gap-2 px-4 py-2 border-b border-gray-200 bg-white shrink-0">
+        <button
+          onClick={() => router.push('/')}
+          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-sm text-gray-600 hover:bg-gray-100 rounded-md transition-colors"
+          aria-label="返回首页"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          返回
+        </button>
+        <span className="text-sm font-medium text-gray-800 truncate">
+          {meeting.title || '会议记录'}
+        </span>
+      </div>
       <div className="flex flex-1 overflow-hidden">
         <TranscriptPanel
           transcripts={meetingData.transcripts}

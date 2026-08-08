@@ -14,6 +14,22 @@ export interface RecordingPreferences {
   preferred_system_device: string | null;
   /** Snack Meet: run the meeting-window auto-detector in the background. */
   auto_detect_meetings: boolean;
+  /** Periodic auto-scan of the recordings folder for new synced transcripts. */
+  auto_scan_enabled: boolean;
+  auto_scan_interval_minutes: number | null;
+  /** "all" | "today" | "custom" */
+  auto_scan_mode: string | null;
+  auto_scan_start: string | null;
+  auto_scan_end: string | null;
+}
+
+// Convert an ISO string (or null) to the format used by <input type="datetime-local">.
+function toLocalInput(iso: string | null): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 interface RecordingSettingsProps {
@@ -27,7 +43,12 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     file_format: 'mp4',
     preferred_mic_device: null,
     preferred_system_device: null,
-    auto_detect_meetings: false
+    auto_detect_meetings: false,
+    auto_scan_enabled: false,
+    auto_scan_interval_minutes: 60,
+    auto_scan_mode: 'all',
+    auto_scan_start: null,
+    auto_scan_end: null,
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -144,6 +165,25 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     }
   };
 
+  // Open a native folder picker so the user can manually choose the recordings
+  // storage location. On success, update the in-memory prefs and persist.
+  const handlePickFolder = async () => {
+    try {
+      const picked = await invoke<string | null>('pick_and_set_recording_folder');
+      if (picked) {
+        setPreferences(prev => ({ ...prev, save_folder: picked }));
+        toast.success('录音存储位置已更新', {
+          description: picked,
+        });
+      }
+    } catch (error) {
+      console.error('Failed to pick recordings folder:', error);
+      toast.error('选择存储位置失败', {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
   const [scanning, setScanning] = useState(false);
 
   // Scan the recordings folder for meeting subfolders that contain a
@@ -153,6 +193,19 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     if (scanning) return;
     setScanning(true);
     try {
+      // Derive the scan time window from the configured mode.
+      const mode = preferences.auto_scan_mode || 'all';
+      let start_time: string | null = null;
+      let end_time: string | null = null;
+      if (mode === 'today') {
+        const now = new Date();
+        const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+        start_time = start.toISOString();
+        end_time = now.toISOString();
+      } else if (mode === 'custom') {
+        start_time = preferences.auto_scan_start || null;
+        end_time = preferences.auto_scan_end || null;
+      }
       const result = await invoke<{
         scanned: number;
         imported: number;
@@ -160,7 +213,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
         skipped: number;
         failed: number;
         imported_meetings: string[];
-      }>('scan_and_import_transcripts', { folderPath: preferences.save_folder });
+      }>('scan_and_import_transcripts', { folderPath: preferences.save_folder, startTime: start_time, endTime: end_time });
       if (result.imported > 0 || result.updated > 0) {
         toast.success(`已导入 ${result.imported} 个、更新 ${result.updated} 个会议`, {
           description: `扫描 ${result.scanned} 个文件夹，跳过 ${result.skipped} 个，失败 ${result.failed} 个。`,
@@ -265,24 +318,33 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
             <div className="text-sm text-gray-600 mb-3 break-all">
               {preferences.save_folder || 'Default folder'}
             </div>
-            <button
-              onClick={handleOpenFolder}
-              className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-50 transition-colors"
-            >
-              <FolderOpen className="w-4 h-4" />
-              Open Folder
-            </button>
-            <button
-              onClick={handleScanImport}
-              disabled={scanning}
-              className="flex items-center gap-2 px-3 py-2 text-sm border border-blue-300 text-blue-700 rounded-md hover:bg-blue-50 transition-colors disabled:opacity-50"
-            >
-              <RefreshCw className={`w-4 h-4 ${scanning ? 'animate-spin' : ''}`} />
-              {scanning ? '扫描中…' : '扫描并导入转写'}
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={handlePickFolder}
+                className="flex items-center gap-2 px-3 py-2 text-sm border border-indigo-300 text-indigo-700 rounded-md hover:bg-indigo-50 transition-colors"
+              >
+                <FolderOpen className="w-4 h-4" />
+                选择存储位置
+              </button>
+              <button
+                onClick={handleOpenFolder}
+                className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-50 transition-colors"
+              >
+                <FolderOpen className="w-4 h-4" />
+                Open Folder
+              </button>
+              <button
+                onClick={handleScanImport}
+                disabled={scanning}
+                className="flex items-center gap-2 px-3 py-2 text-sm border border-blue-300 text-blue-700 rounded-md hover:bg-blue-50 transition-colors disabled:opacity-50"
+              >
+                <RefreshCw className={`w-4 h-4 ${scanning ? 'animate-spin' : ''}`} />
+                {scanning ? '扫描中…' : '扫描并导入转写'}
+              </button>
+            </div>
             <p className="text-xs text-gray-500 mt-2">
-              扫描此文件夹下含 transcripts.json 的会议子文件夹（例如台式机转写后同步过来的），
-              导入到本地会议列表。
+              选择存储位置用于设定录音的保存目录；扫描会在此目录下查找含 transcripts.json 的会议子文件夹
+              （例如台式机转写后同步过来的），导入到本地会议列表。
             </p>
           </div>
 
@@ -334,6 +396,113 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
           onCheckedChange={handleAutoDetectMeetingsToggle}
           disabled={saving}
         />
+      </div>
+
+      {/* Snack Meet — Auto-scan recordings folder */}
+      <div className="p-4 border rounded-lg space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex-1">
+            <div className="font-medium">自动扫描转写</div>
+            <div className="text-sm text-gray-600">
+              定期扫描录音存储位置，自动导入台式机转写后同步过来的 transcripts.json。
+            </div>
+          </div>
+          <Switch
+            checked={preferences.auto_scan_enabled}
+            onCheckedChange={(enabled) => {
+              const next = { ...preferences, auto_scan_enabled: enabled };
+              setPreferences(next);
+              savePreferences(next);
+            }}
+            disabled={saving}
+          />
+        </div>
+
+        {preferences.auto_scan_enabled && (
+          <div className="space-y-3 pt-1">
+            {/* Interval */}
+            <div className="flex items-center gap-3">
+              <span className="text-sm text-gray-600 w-24 shrink-0">扫描间隔</span>
+              <select
+                value={preferences.auto_scan_interval_minutes ?? 60}
+                onChange={(e) => {
+                  const next = {
+                    ...preferences,
+                    auto_scan_interval_minutes: Number(e.target.value),
+                  };
+                  setPreferences(next);
+                  savePreferences(next);
+                }}
+                className="px-2 py-1.5 text-sm border border-gray-300 rounded-md bg-white"
+              >
+                <option value={15}>15 分钟</option>
+                <option value={30}>30 分钟</option>
+                <option value={60}>1 小时</option>
+                <option value={180}>3 小时</option>
+                <option value={360}>6 小时</option>
+              </select>
+            </div>
+
+            {/* Time filter mode */}
+            <div className="flex items-center gap-3">
+              <span className="text-sm text-gray-600 w-24 shrink-0">扫描范围</span>
+              <select
+                value={preferences.auto_scan_mode || 'all'}
+                onChange={(e) => {
+                  const next = { ...preferences, auto_scan_mode: e.target.value };
+                  setPreferences(next);
+                  savePreferences(next);
+                }}
+                className="px-2 py-1.5 text-sm border border-gray-300 rounded-md bg-white"
+              >
+                <option value="all">全部（扫描所有会议）</option>
+                <option value="today">仅今天</option>
+                <option value="custom">自定义时间范围</option>
+              </select>
+            </div>
+
+            {/* Custom range inputs */}
+            {preferences.auto_scan_mode === 'custom' && (
+              <div className="space-y-2 pl-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-gray-600 w-24 shrink-0">开始时间</span>
+                  <input
+                    type="datetime-local"
+                    value={toLocalInput(preferences.auto_scan_start)}
+                    onChange={(e) => {
+                      const next = {
+                        ...preferences,
+                        auto_scan_start: e.target.value ? new Date(e.target.value).toISOString() : null,
+                      };
+                      setPreferences(next);
+                      savePreferences(next);
+                    }}
+                    className="flex-1 px-2 py-1.5 text-sm border border-gray-300 rounded-md bg-white"
+                  />
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-gray-600 w-24 shrink-0">结束时间</span>
+                  <input
+                    type="datetime-local"
+                    value={toLocalInput(preferences.auto_scan_end)}
+                    onChange={(e) => {
+                      const next = {
+                        ...preferences,
+                        auto_scan_end: e.target.value ? new Date(e.target.value).toISOString() : null,
+                      };
+                      setPreferences(next);
+                      savePreferences(next);
+                    }}
+                    className="flex-1 px-2 py-1.5 text-sm border border-gray-300 rounded-md bg-white"
+                  />
+                </div>
+                <p className="text-xs text-gray-500">
+                  只扫描录音创建时间在该范围内的会议。
+                </p>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Device Preferences */}

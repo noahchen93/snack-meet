@@ -60,6 +60,7 @@ pub mod utils;
 pub mod whisper_engine;
 
 use audio::{list_audio_devices, AudioDevice};
+use chrono::Utc;
 use log::{error as log_error, info as log_info};
 use notifications::commands::NotificationManagerState;
 use std::sync::Arc;
@@ -82,6 +83,30 @@ struct TranscriptionStatus {
     chunks_in_queue: usize,
     is_processing: bool,
     last_activity_ms: u64,
+}
+
+/// Derive the (start, end) RFC3339 window for an auto-scan from the configured
+/// mode. "all" -> (None, None); "today" -> [00:00 today, now); "custom" ->
+/// [auto_scan_start, auto_scan_end). Returns (None, None) if no filtering.
+fn scan_time_window(prefs: &audio::recording_preferences::RecordingPreferences) -> (Option<String>, Option<String>) {
+    let mode = prefs.auto_scan_mode.as_deref().unwrap_or("all");
+    match mode {
+        "today" => {
+            let now = Utc::now();
+            let start = now
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .and_then(|naive| chrono::DateTime::<Utc>::from_utc(naive, Utc).to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into());
+            let end = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            (start, Some(end))
+        }
+        "custom" => {
+            let s = prefs.auto_scan_start.clone().filter(|s| !s.is_empty());
+            let e = prefs.auto_scan_end.clone().filter(|s| !s.is_empty());
+            (s, e)
+        }
+        _ => (None, None),
+    }
 }
 
 #[tauri::command]
@@ -554,7 +579,8 @@ pub fn run() {
 
             // Auto-scan the recordings folder for synced transcripts.json files
             // (e.g. transcribed by a desktop machine and synced via Baidu Netdisk)
-            // and import any new ones into the local database.
+            // and import any new ones into the local database. No time filter on
+            // launch by default (scan everything).
             let scan_app = _app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let prefs = audio::recording_preferences::load_recording_preferences(&scan_app)
@@ -562,10 +588,49 @@ pub fn run() {
                     .unwrap_or_default();
                 let save_folder = prefs.save_folder.to_string_lossy().to_string();
                 if !save_folder.is_empty() {
-                    if let Err(e) =
-                        audio::import::scan_and_import_transcripts(scan_app, save_folder).await
+                    if let Err(e) = audio::import::scan_and_import_transcripts(
+                        scan_app, save_folder, None, None,
+                    )
+                    .await
                     {
                         log::warn!("Auto scan-and-import on launch failed: {}", e);
+                    }
+                }
+            });
+
+            // Periodic auto-scan loop: when auto_scan_enabled is true, scan the
+            // recordings folder every auto_scan_interval_minutes. The time window
+            // is derived from the configured mode each cycle so that "today"
+            // keeps working and "custom" honors the stored range.
+            let periodic_app = _app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    // Sleep a fixed tick (default 60s). Interval is re-read from
+                    // prefs every tick so the user's setting applies promptly.
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+                    let prefs =
+                        audio::recording_preferences::load_recording_preferences(&periodic_app)
+                            .await
+                            .unwrap_or_default();
+                    if !prefs.auto_scan_enabled {
+                        continue;
+                    }
+                    let save_folder = prefs.save_folder.to_string_lossy().to_string();
+                    if save_folder.is_empty() {
+                        continue;
+                    }
+
+                    let (start, end) = scan_time_window(&prefs);
+                    if let Err(e) = audio::import::scan_and_import_transcripts(
+                        periodic_app.clone(),
+                        save_folder,
+                        start,
+                        end,
+                    )
+                    .await
+                    {
+                        log::warn!("Periodic auto-scan failed: {}", e);
                     }
                 }
             });
@@ -761,6 +826,7 @@ pub fn run() {
             audio::recording_preferences::get_recording_preferences,
             audio::recording_preferences::set_recording_preferences,
             audio::recording_preferences::get_default_recordings_folder_path,
+            audio::recording_preferences::pick_and_set_recording_folder,
             audio::recording_preferences::open_recordings_folder,
             audio::recording_preferences::select_recording_folder,
             audio::recording_preferences::get_available_audio_backends,

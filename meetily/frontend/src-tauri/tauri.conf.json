@@ -111,6 +111,7 @@
                         "notification:allow-is-permission-granted",
                         "dialog:allow-confirm",
                         "dialog:allow-save",
+                        "dialog:allow-open",
                         "updater:default",
                         "process:default",
                         {
