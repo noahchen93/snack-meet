@@ -5,6 +5,38 @@
 
 ---
 
+## 本次会话进度（2026-08-08）
+
+### 10. 会议按录音时间排序/分区（f141591）
+- `import.rs` 新增 `read_recording_created_at`：从会议文件夹 `metadata.json` 读真实录音创建时间作为 `created_at`
+- **回填**：启动自动扫描时，已导入会议用 metadata.json 时间回填 `created_at`
+- `get_meetings` 按 `created_at DESC` 排序 → 自然按录音时间倒序
+- `HomeDashboard.tsx` 按天分组（今天/昨天/具体日期+星期），每组显示"X 个会议"
+
+### 11. 手动存储位置 + 返回按钮 + 自动扫描时间过滤（216b692）
+- **手动选存储位置**：`pick_and_set_recording_folder`（recording_preferences.rs，原生文件夹对话框）+ `dialog:allow-open` 权限；前端 RecordingSettings 加"选择存储位置"按钮，默认 `~/Movies/meetily-recordings` 不变
+- **返回按钮**：会议详情页顶部返回栏（← 返回 + 标题），`router.push('/')`
+- **自动扫描时间过滤**：`scan_and_import_transcripts` 加 `start_time`/`end_time`(RFC3339) 参数；RecordingPreferences 加 `auto_scan_enabled`/`auto_scan_interval_minutes`/`auto_scan_mode`(all|today|custom)/`auto_scan_start`/`auto_scan_end`
+- lib.rs `scan_time_window` 派生时间窗；定时循环每 60s 检查配置并扫描。**范围始终是 save_folder，非全盘**
+- 前端 RecordingSettings 加"自动扫描转写"UI（开关+间隔+范围）
+
+### 12. 双通道立体声录音（ac8e236，方案A）
+- **方案**：audio.mp4 = 立体声，**左声道=mic，右声道=system**，不额外占空间
+- `pipeline.rs` STEP4 改为交织 mic/sys 立体声；`incremental_saver.rs` checkpoint 按 2 声道编码
+- 转写仍用混合单声道（VAD），分离音轨供台式机离线精确说话人分离
+- 旧录音仍是单声道（改动前）；新录音才是立体声
+
+### 13. Summary 模型配置 + 404 修复
+- Summary AI 配置为 **Ollama DeepSeek Flash V4.0731**：`settings` 表 `provider=ollama`, `model=deepseek-v4-flash:0731-cloud`, `ollamaEndpoint=http://localhost:11434`（**不带 /v1**）
+- **404 踩坑**：`llm_client.rs` 对 Ollama 会拼 `{host}/v1/chat/completions`，所以 endpoint **不能带 /v1**，否则变 `/v1/v1/chat/completions` → 404
+- 数据库直接 UPDATE settings 即可（备份 `meeting_minutes.sqlite.bak_modelconfig_*`）
+
+### 14. 首页与 Meeting Notes 合并（260e3c6, b1e5659）
+- **方案3**：首页成为完整会议管理页
+- `HomeDashboard.tsx`：展示**全部会议**（去掉"最近12个"上限），新增**标题搜索框**，空态区分"搜索无结果/无记录"，标题改"会议记录"
+- `Sidebar/index.tsx`：移除重复的 **Meeting Notes 文件夹**、其会议子项、搜索框、折叠 Notes 图标；清理死 import（NotebookPen、SearchIcon、X、InputGroup）
+- 会议管理（总览/搜索/翻阅/批量删除/下拉菜单）全部在首页
+
 ## 项目定位
 
 Snack Meet = **meetily**（Rust + Tauri + Next.js 主应用）+ 从 **Snack Record**（Objective-C）移植的会议窗口自动检测逻辑，融合成的**单应用** macOS 菜单栏录音转写工具。
@@ -118,11 +150,13 @@ snack-meet/
 
 ## 待办 / 下一步
 
-- [ ] 真实会议全流程验证（检测→录音→转写→总结→中文重命名）
+- [x] 双通道录音（已完成，方案A：立体声 L=mic/R=system）
+- [ ] ~~真实会议全流程验证~~（用户确认不做）
+- [ ] **summary 完成后自动智能命名**：目前 `extract_meeting_name_from_markdown` 只简单提取 markdown 首个 `#` 标题（不可靠，可能得到英文/通用词如 "Technical Review of Logo Design"）。应基于 summary 内容用 LLM 生成中文标题（可复用 copilot 的 `generate_meeting_title`，但需解决 summary 模块→copilot 的循环依赖，可把标题生成抽到公共模块）
+- [ ] **AI 副驾自动提醒的触发频率/质量调优**（大问题，用户最后做）
 - [ ] 微信/WhatsApp 语音通话实测（需真实通话）
-- [ ] AI 副驾自动提醒的触发频率/质量调优
 - [ ] 悬浮窗 AI 副驾按钮与 copilot 窗口联调确认
-- [ ] 可选：双通道录音保存原始 mic/system 分离音轨，做离线精确说话人分离
+- [ ] 台式机端离线精确说话人分离：把新录音立体声拆 L=mic/R=system，用 pyannote 等精确 diarization，产出 speaker 名字写回 transcripts.json
 
 ### 7. 导出为 Markdown（新增）
 - `useExportMeeting.ts`：把会议转写 + 总结导出为 .md 文件
