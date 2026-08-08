@@ -516,24 +516,6 @@ const Sidebar: React.FC = () => {
           <Tooltip>
             <TooltipTrigger asChild>
               <button
-                onClick={() => {
-                  if (isCollapsed) toggleCollapse();
-                  toggleFolder('meetings');
-                }}
-                className={`p-2 rounded-lg transition-colors duration-150 ${isMeetingPage ? 'bg-gray-100' : 'hover:bg-gray-100'
-                  }`}
-              >
-                <NotebookPen className="w-5 h-5 text-gray-600" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="right">
-              <p>Meeting Notes</p>
-            </TooltipContent>
-          </Tooltip>
-
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
                 onClick={() => router.push('/settings')}
                 className={`p-2 rounded-lg transition-colors duration-150 ${isSettingsPage ? 'bg-gray-100' : 'hover:bg-gray-100'
                   }`}
@@ -715,30 +697,7 @@ const Sidebar: React.FC = () => {
           <div className="flex-1">
             {!isCollapsed && (
               <div className="p-3">
-                {/* <span className="text-lg text-center border rounded-full bg-blue-50 border-white font-semibold text-gray-700 mb-2 block items-center">
-                  <span>Meetily</span>
-                </span> */}
                 <Logo isCollapsed={isCollapsed} />
-
-                <div className="relative mb-1">
-                  <InputGroup >
-                    <InputGroupInput placeholder='Search meeting content...' value={searchQuery}
-                      onChange={(e) => handleSearchChange(e.target.value)}
-                    />
-                    <InputGroupAddon>
-                      <SearchIcon />
-                    </InputGroupAddon>
-                    {searchQuery &&
-                      <InputGroupAddon align={'inline-end'}>
-                        <InputGroupButton
-                          onClick={() => handleSearchChange('')}
-                        >
-                          <X />
-                        </InputGroupButton>
-                      </InputGroupAddon>
-                    }
-                  </InputGroup>
-                </div>
               </div>
             )}
           </div>
@@ -762,37 +721,8 @@ const Sidebar: React.FC = () => {
           {/* Content area */}
           <div className="flex-1 flex flex-col min-h-0">
             {renderCollapsedIcons()}
-            {/* Meeting Notes folder header - fixed */}
-            {!isCollapsed && (
-              <div className="flex-shrink-0">
-                {filteredSidebarItems.filter(item => item.type === 'folder').map(item => (
-                  <div key={item.id}>
-                    <div
-                      className="flex items-center transition-all duration-150 p-3 text-lg font-semibold h-10 mx-3 mt-3 rounded-lg"
-                    >
-                      <NotebookPen className="w-4 h-4 mr-2 text-gray-600" />
-                      <span className="text-gray-700">{item.title}</span>
-                      {searchQuery && item.id === 'meetings' && isSearching && (
-                        <span className="ml-2 text-xs text-blue-500 animate-pulse">Searching...</span>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Scrollable meeting items */}
-            {!isCollapsed && (
-              <div className="flex-1 overflow-y-auto custom-scrollbar min-h-0">
-                {filteredSidebarItems
-                  .filter(item => item.type === 'folder' && expandedFolders.has(item.id) && item.children)
-                  .map(item => (
-                    <div key={`${item.id}-children`} className="mx-3">
-                      {item.children!.map(child => renderItem(child, 1))}
-                    </div>
-                  ))}
-              </div>
-            )}
+            {/* Meeting list is now shown on the Home page (merged), so the
+                sidebar only keeps the Home navigation. */}
           </div>
         </div>
 

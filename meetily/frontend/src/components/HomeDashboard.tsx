@@ -66,6 +66,8 @@ export function HomeDashboard() {
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
   const [bulkDeleteFiles, setBulkDeleteFiles] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Search/filter
+  const [query, setQuery] = useState('');
 
   useEffect(() => {
     refetchMeetings().finally(() => setLoading(false));
@@ -212,8 +214,13 @@ export function HomeDashboard() {
     }
   };
 
-  // Most recent first (backend already orders by created_at DESC)
-  const recent = meetings.slice(0, 12);
+  // Most recent first (backend already orders by created_at DESC).
+  // Show ALL meetings (merged into this page), optionally filtered by search query.
+  const q = query.trim().toLowerCase();
+  const visible = q
+    ? meetings.filter((m) => (m.title || '').toLowerCase().includes(q))
+    : meetings;
+  const recent = visible;
   const allSelected = recent.length > 0 && selected.size === recent.length;
 
   // Group meetings by their recording date (day label). Used to render the
@@ -266,10 +273,20 @@ export function HomeDashboard() {
       {/* Header */}
       <div className="mb-6 flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">最近的会议</h1>
-          <p className="text-sm text-gray-500 mt-1">快速查看和回听你的录音记录</p>
+          <h1 className="text-2xl font-bold text-gray-900">会议记录</h1>
+          <p className="text-sm text-gray-500 mt-1">管理、总览和翻阅你的全部会议记录</p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
+          <div className="relative">
+            <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="搜索会议标题…"
+              className="w-56 pl-9 pr-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+            />
+          </div>
           <button
             onClick={handleScan}
             disabled={scanning}
@@ -292,8 +309,17 @@ export function HomeDashboard() {
           <div className="w-16 h-16 rounded-full bg-indigo-50 flex items-center justify-center mb-4">
             <Mic2 className="w-8 h-8 text-indigo-400" />
           </div>
-          <p className="text-lg font-medium text-gray-700">还没有录音记录</p>
-          <p className="text-sm text-gray-400 mt-1">开启录音后，你的会议记录会显示在这里</p>
+          {q ? (
+            <>
+              <p className="text-lg font-medium text-gray-700">没有找到匹配的会议</p>
+              <p className="text-sm text-gray-400 mt-1">换个关键词试试</p>
+            </>
+          ) : (
+            <>
+              <p className="text-lg font-medium text-gray-700">还没有录音记录</p>
+              <p className="text-sm text-gray-400 mt-1">开启录音后，你的会议记录会显示在这里</p>
+            </>
+          )}
         </div>
       ) : (
         <div>
@@ -411,17 +437,6 @@ export function HomeDashboard() {
               </section>
             ))}
           </div>
-        </div>
-      )}
-
-      {recent.length > 12 && (
-        <div className="mt-6 text-center">
-          <button
-            onClick={() => router.push('/')}
-            className="inline-flex items-center gap-1 text-sm text-indigo-600 hover:text-indigo-500"
-          >
-            在侧边栏查看全部记录
-          </button>
         </div>
       )}
 
