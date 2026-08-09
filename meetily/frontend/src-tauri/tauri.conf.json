@@ -40,23 +40,6 @@
                 "visible": false,
                 "focus": false,
                 "shadow": false
-            },
-            {
-                "label": "ai-copilot",
-                "title": "Snack Meet Copilot",
-                "url": "ai-copilot.html",
-                "width": 380,
-                "height": 560,
-                "minWidth": 320,
-                "minHeight": 400,
-                "resizable": true,
-                "fullscreen": false,
-                "decorations": false,
-                "transparent": true,
-                "alwaysOnTop": true,
-                "skipTaskbar": true,
-                "visible": false,
-                "shadow": true
             }
         ],
         "macOSPrivateApi": true,
@@ -79,8 +62,7 @@
                     "description": "Main window capability with file system and media access",
                     "windows": [
                         "main",
-                        "recording-overlay",
-                        "ai-copilot"
+                        "recording-overlay"
                     ],
                     "permissions": [
                         "fs:default",

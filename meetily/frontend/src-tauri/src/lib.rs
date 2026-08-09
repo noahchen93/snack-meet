@@ -802,13 +802,8 @@ pub fn run() {
             summary::commands::api_save_meeting_detected_summary_language,
             summary::commands::api_detect_transcript_summary_language,
             summary::commands::api_cancel_summary,
-            // AI Copilot (experimental live meeting assistant)
-            copilot::copilot_ask,
-            copilot::copilot_save_context_document,
-            copilot::copilot_get_context_document,
-            copilot::copilot_get_cloud_config,
-            copilot::copilot_save_cloud_config,
-            copilot::copilot_smart_rename_meeting,
+            // Smart meeting renaming (content-based Chinese title)
+            copilot::smart_rename_meeting,
             // Template commands
             summary::template_commands::api_list_templates,
             summary::template_commands::api_get_template_details,

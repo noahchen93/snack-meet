@@ -366,16 +366,11 @@ export function HomeDashboard() {
                         }`}
                       >
                         {/* Selection checkbox */}
-                        <div
-                          className="absolute top-3 left-3 z-10"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleSelect(meeting.id);
-                          }}
-                        >
+                        <div className="absolute top-3 left-3 z-10">
                           <input
                             type="checkbox"
                             checked={isSelected}
+                            onClick={(e) => e.stopPropagation()}
                             onChange={() => toggleSelect(meeting.id)}
                             className="w-4 h-4 text-indigo-600"
                           />

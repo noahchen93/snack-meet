@@ -47,25 +47,11 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, item_id: &str) {
             }
         }
         "check_updates" => check_updates_handler(app),
-        "toggle_copilot" => toggle_copilot_window(app),
         "quit" => app.exit(0),
         _ => {}
     }
 }
 
-/// Show (and focus) or hide the AI Copilot window.
-fn toggle_copilot_window<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(window) = app.get_webview_window("ai-copilot") {
-        let _ = window.is_visible().map(|visible| {
-            if visible {
-                let _ = window.hide();
-            } else {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-        });
-    }
-}
 fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
     focus_main_window(app);
     let app_clone = app.clone();
@@ -422,7 +408,6 @@ fn build_menu<R: Runtime>(
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&MenuItemBuilder::with_id("open_window", "Open Main Window").build(app)?)
         .item(&MenuItemBuilder::with_id("settings", "Settings").build(app)?)
-        .item(&MenuItemBuilder::with_id("toggle_copilot", "🧠 AI Copilot").build(app)?)
         .item(&MenuItemBuilder::with_id("check_updates", "Check for Updates").build(app)?)
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&MenuItemBuilder::with_id("quit", "Quit").build(app)?)
