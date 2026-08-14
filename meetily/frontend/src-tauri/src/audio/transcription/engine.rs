@@ -48,6 +48,17 @@ impl TranscriptionEngine {
     }
 }
 
+/// Only remote providers may run while audio capture is active. Local models
+/// are intentionally deferred until the recording file has been finalized so
+/// they cannot compete with capture, mixing, and the meeting app for CPU/GPU.
+pub fn provider_supports_live_transcription(provider: &str) -> bool {
+    matches!(provider, "openai")
+}
+
+pub fn provider_uses_deferred_transcription(provider: &str) -> bool {
+    matches!(provider, "localWhisper" | "parakeet")
+}
+
 // ============================================================================
 // MODEL VALIDATION AND INITIALIZATION
 // ============================================================================
@@ -148,13 +159,23 @@ pub async fn validate_transcription_model_ready<R: Runtime>(
                 }
             }
         }
+        "openai" => {
+            info!("🔍 Validating OpenAI Whisper API transcription");
+            match config.api_key.as_deref() {
+                Some(key) if !key.trim().is_empty() => {
+                    info!("✅ OpenAI API key present");
+                    Ok(())
+                }
+                _ => Err("OpenAI 转写需要 API Key，请先在转写设置中配置。".to_string()),
+            }
+        }
         other => {
             warn!(
                 "❌ Unsupported transcription provider for local recording: {}",
                 other
             );
             Err(format!(
-                "Provider '{}' is not supported for local transcription. Please select 'localWhisper' or 'parakeet'.",
+                "Provider '{}' is not supported for local transcription. Please select 'localWhisper', 'parakeet', or 'openai'.",
                 other
             ))
         }
@@ -230,6 +251,29 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                         .to_string(),
                 ),
             }
+        }
+        "openai" => {
+            info!("☁️ Initializing OpenAI Whisper API transcription provider");
+
+            let api_key = config
+                .api_key
+                .as_deref()
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| "OpenAI 转写需要 API Key，请先在转写设置中配置。".to_string())?;
+
+            let model = if config.model.trim().is_empty() {
+                "whisper-1".to_string()
+            } else {
+                config.model
+            };
+
+            let provider = Arc::new(
+                crate::audio::transcription::openai_provider::OpenAIWhisperApiProvider::new(
+                    api_key, model,
+                ),
+            );
+            Ok(TranscriptionEngine::Provider(provider))
         }
         "localWhisper" | _ => {
             info!("🎤 Initializing Whisper transcription engine");
@@ -497,7 +541,10 @@ pub async fn check_transcription_readiness<R: Runtime>(
                 api_key: None,
             },
             Err(e) => {
-                warn!("⚠️ Failed to get transcript config for readiness check: {}", e);
+                warn!(
+                    "⚠️ Failed to get transcript config for readiness check: {}",
+                    e
+                );
                 crate::api::api::TranscriptConfig {
                     provider: "parakeet".to_string(),
                     model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
@@ -516,83 +563,25 @@ pub async fn check_transcription_readiness<R: Runtime>(
     };
 
     match config.provider.as_str() {
-        "localWhisper" => {
-            info!("🔍 Checking Whisper readiness for auto-record");
-            if let Err(init_error) = crate::whisper_engine::commands::whisper_init().await {
-                result.error = Some(format!(
-                    "Failed to initialize speech recognition: {}",
-                    init_error
-                ));
-                return Ok(result);
-            }
-
-            match crate::whisper_engine::commands::whisper_validate_model_ready_with_config(&app)
-                .await
-            {
-                Ok(model_name) => {
-                    info!("✅ Whisper model ready for auto-record: {}", model_name);
-                    result.ready = true;
-                    result.current_model = Some(model_name);
-                }
-                Err(e) => {
-                    warn!("❌ Whisper model not ready for auto-record: {}", e);
-                    result.error = Some(e);
-                }
-            }
-
-            // Collect available model names for the UI message/action
-            if let Some(engine) = {
-                let guard = crate::whisper_engine::commands::WHISPER_ENGINE.lock().unwrap();
-                guard.as_ref().cloned()
-            } {
-                if let Ok(models) = engine.discover_models().await {
-                    result.available_models = models
-                        .iter()
-                        .filter(|m| matches!(m.status, crate::whisper_engine::ModelStatus::Available))
-                        .map(|m| m.name.clone())
-                        .collect();
-                }
-            }
+        "localWhisper" | "parakeet" => {
+            // Recording itself no longer depends on a local model. Do not even
+            // initialize the engine here: loading it before capture is exactly
+            // the sustained-resource spike this deferred mode prevents.
+            info!(
+                "✅ {} configured for deferred post-recording transcription",
+                config.provider
+            );
+            result.ready = true;
         }
-        "parakeet" => {
-            info!("🔍 Checking Parakeet readiness for auto-record");
-            if let Err(init_error) = crate::parakeet_engine::commands::parakeet_init().await {
-                result.error = Some(format!(
-                    "Failed to initialize speech recognition: {}",
-                    init_error
-                ));
-                return Ok(result);
+        "openai" => match config.api_key.as_deref() {
+            Some(key) if !key.trim().is_empty() => {
+                result.ready = true;
+                result.current_model = Some(config.model.clone());
             }
-
-            match crate::parakeet_engine::commands::parakeet_validate_model_ready_with_config(&app)
-                .await
-            {
-                Ok(model_name) => {
-                    info!("✅ Parakeet model ready for auto-record: {}", model_name);
-                    result.ready = true;
-                    result.current_model = Some(model_name);
-                }
-                Err(e) => {
-                    warn!("❌ Parakeet model not ready for auto-record: {}", e);
-                    result.error = Some(e);
-                }
+            _ => {
+                result.error = Some("OpenAI 转写需要 API Key，请先在转写设置中配置。".to_string());
             }
-
-            if let Some(engine) = {
-                let guard = crate::parakeet_engine::commands::PARAKEET_ENGINE.lock().unwrap();
-                guard.as_ref().cloned()
-            } {
-                if let Ok(models) = engine.discover_models().await {
-                    result.available_models = models
-                        .iter()
-                        .filter(|m| {
-                            matches!(m.status, crate::parakeet_engine::ModelStatus::Available)
-                        })
-                        .map(|m| m.name.clone())
-                        .collect();
-                }
-            }
-        }
+        },
         other => {
             result.error = Some(format!(
                 "Provider '{}' is not supported for local transcription. Please select 'localWhisper' or 'parakeet'.",
@@ -602,4 +591,23 @@ pub async fn check_transcription_readiness<R: Runtime>(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod live_transcription_tests {
+    use super::{provider_supports_live_transcription, provider_uses_deferred_transcription};
+
+    #[test]
+    fn local_providers_are_always_deferred() {
+        assert!(provider_uses_deferred_transcription("localWhisper"));
+        assert!(provider_uses_deferred_transcription("parakeet"));
+        assert!(!provider_supports_live_transcription("localWhisper"));
+        assert!(!provider_supports_live_transcription("parakeet"));
+    }
+
+    #[test]
+    fn supported_cloud_provider_can_transcribe_live() {
+        assert!(provider_supports_live_transcription("openai"));
+        assert!(!provider_uses_deferred_transcription("openai"));
+    }
 }

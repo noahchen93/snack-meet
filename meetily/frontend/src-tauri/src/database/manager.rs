@@ -9,6 +9,25 @@ pub struct DatabaseManager {
 }
 
 impl DatabaseManager {
+    fn preserve_recovery_bundle(app_data_dir: &Path) -> std::io::Result<std::path::PathBuf> {
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let recovery_dir = app_data_dir.join("database-recovery").join(stamp);
+        fs::create_dir_all(&recovery_dir)?;
+
+        for filename in [
+            "meeting_minutes.sqlite",
+            "meeting_minutes.sqlite-wal",
+            "meeting_minutes.sqlite-shm",
+        ] {
+            let source = app_data_dir.join(filename);
+            if source.exists() {
+                fs::copy(&source, recovery_dir.join(filename))?;
+            }
+        }
+
+        Ok(recovery_dir)
+    }
+
     pub async fn new(tauri_db_path: &str, backend_db_path: &str) -> Result<Self> {
         if let Some(parent_dir) = Path::new(tauri_db_path).parent() {
             if !parent_dir.exists() {
@@ -62,57 +81,33 @@ impl DatabaseManager {
             .to_string_lossy()
             .to_string();
 
-        // WAL file paths for defensive cleanup
-        let wal_path = app_data_dir.join("meeting_minutes.sqlite-wal");
-        let shm_path = app_data_dir.join("meeting_minutes.sqlite-shm");
-
         log::info!("Tauri DB path: {}", tauri_db_path);
         log::info!("Legacy backend DB path: {}", backend_db_path);
 
-        // Try to open database with defensive WAL handling
+        // Never delete WAL/SHM during recovery: a WAL may contain the newest
+        // committed meeting data. Preserve the complete SQLite file set and
+        // surface the failure so recovery can be performed without data loss.
         match Self::new(&tauri_db_path, &backend_db_path).await {
             Ok(db_manager) => {
                 log::info!("Database opened successfully");
                 Ok(db_manager)
             }
             Err(e) => {
-                // Check if error is due to corrupted WAL file
                 let error_msg = e.to_string();
                 if error_msg.contains("malformed") || error_msg.contains("corrupt") {
-                    log::warn!("Database appears corrupted, likely due to orphaned WAL file. Attempting recovery...");
-                    log::warn!("Error details: {}", error_msg);
-
-                    // Delete potentially corrupted WAL/SHM files
-                    if wal_path.exists() {
-                        match fs::remove_file(&wal_path) {
-                            Ok(_) => log::info!("Removed orphaned WAL file: {:?}", wal_path),
-                            Err(e) => log::warn!("Failed to remove WAL file: {}", e),
-                        }
+                    log::error!("Database appears corrupted: {}", error_msg);
+                    match Self::preserve_recovery_bundle(&app_data_dir) {
+                        Ok(path) => log::error!(
+                            "Preserved database, WAL and SHM for recovery at {}",
+                            path.display()
+                        ),
+                        Err(backup_error) => log::error!(
+                            "Failed to create database recovery bundle: {}",
+                            backup_error
+                        ),
                     }
-                    if shm_path.exists() {
-                        match fs::remove_file(&shm_path) {
-                            Ok(_) => log::info!("Removed orphaned SHM file: {:?}", shm_path),
-                            Err(e) => log::warn!("Failed to remove SHM file: {}", e),
-                        }
-                    }
-
-                    // Retry connection without WAL files
-                    log::info!("Retrying database connection after WAL cleanup...");
-                    match Self::new(&tauri_db_path, &backend_db_path).await {
-                        Ok(db_manager) => {
-                            log::info!("Database opened successfully after WAL recovery");
-                            Ok(db_manager)
-                        }
-                        Err(retry_err) => {
-                            log::error!(
-                                "Database connection failed even after WAL cleanup: {}",
-                                retry_err
-                            );
-                            Err(retry_err)
-                        }
-                    }
+                    Err(e)
                 } else {
-                    // Not a WAL-related error, propagate original error
                     log::error!("Database connection failed: {}", error_msg);
                     Err(e)
                 }

@@ -99,7 +99,12 @@ impl ChannelEnergyEstimator {
     ///
     /// `window_duration_ms` is the real-time duration of the window.  The
     /// estimator internally maintains a monotonic timeline starting at 0 ms.
-    pub fn add_window(&mut self, window_duration_ms: f64, mic_samples: &[f32], sys_samples: &[f32]) {
+    pub fn add_window(
+        &mut self,
+        window_duration_ms: f64,
+        mic_samples: &[f32],
+        sys_samples: &[f32],
+    ) {
         let start_ms = self.next_start_ms;
         let end_ms = start_ms + window_duration_ms;
         self.next_start_ms = end_ms;
@@ -226,11 +231,13 @@ mod tests {
     use super::*;
 
     fn make_window(amp: f32, len: usize) -> Vec<f32> {
-        (0..len).map(|i| {
-            // Simple sine-ish signal so energy scales with amplitude
-            let t = i as f32 / len as f32;
-            (t * std::f32::consts::TAU).sin() * amp
-        }).collect()
+        (0..len)
+            .map(|i| {
+                // Simple sine-ish signal so energy scales with amplitude
+                let t = i as f32 / len as f32;
+                (t * std::f32::consts::TAU).sin() * amp
+            })
+            .collect()
     }
 
     #[test]

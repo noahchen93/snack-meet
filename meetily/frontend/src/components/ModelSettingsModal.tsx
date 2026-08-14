@@ -29,6 +29,7 @@ import {
 } from '@/components/ui/command';
 import { cn, isOllamaNotInstalledError } from '@/lib/utils';
 import { toast } from 'sonner';
+import { readStringMap, writeStringMap } from '@/lib/safe-storage';
 
 export interface ModelConfig {
   provider: 'ollama' | 'groq' | 'claude' | 'openai' | 'openrouter' | 'builtin-ai' | 'custom-openai';
@@ -99,6 +100,14 @@ const GROQ_FALLBACK_MODELS = [
   'llama-3.1-70b-versatile',
   'mixtral-8x7b-32768',
   'gemma2-9b-it',
+];
+
+// Recommended local (Ollama) summary models for quick download & testing.
+// These are suggestions; users can pull any other model tag from Ollama.
+const RECOMMENDED_LOCAL_MODELS = [
+  { name: 'qwen3.5:4b', label: 'Qwen3.5 4B', note: '极高性价比 · 很快', badge: '推荐' },
+  { name: 'qwen3.5:9b', label: 'Qwen3.5 9B', note: '最均衡', badge: '推荐' },
+  { name: 'gemma4:12b-q4', label: 'Gemma 4 12B Q4', note: '质量更重 · 稍重', badge: '' },
 ];
 
 interface ModelSettingsModalProps {
@@ -607,7 +616,7 @@ export function ModelSettingsModal({
     if (modelConfig.model && providerModels.includes(modelConfig.model)) return;
 
     // Try to restore from localStorage cache
-    const map = JSON.parse(localStorage.getItem('providerModelMap') || '{}');
+    const map = readStringMap('providerModelMap');
     const cachedModel = map[modelConfig.provider];
     if (cachedModel && providerModels.includes(cachedModel)) {
       setModelConfig((prev: ModelConfig) => ({ ...prev, model: cachedModel }));
@@ -655,9 +664,9 @@ export function ModelSettingsModal({
 
     // Persist confirmed model choice to per-provider cache
     if (updatedConfig.model) {
-      const map = JSON.parse(localStorage.getItem('providerModelMap') || '{}');
+      const map = readStringMap('providerModelMap');
       map[updatedConfig.provider] = updatedConfig.model;
-      localStorage.setItem('providerModelMap', JSON.stringify(map));
+      writeStringMap('providerModelMap', map);
     }
 
     // Update provider-specific key in context
@@ -698,14 +707,12 @@ export function ModelSettingsModal({
     }
   };
 
-  // Function to download recommended model
-  const downloadRecommendedModel = async () => {
-    const recommendedModel = 'gemma3:1b';
-
+  // Function to download a specific Ollama model
+  const downloadOllamaModel = async (modelName: string) => {
     // Prevent duplicate downloads (defense in depth - backend also checks)
-    if (isDownloading(recommendedModel)) {
-      toast.info(`${recommendedModel} is already downloading`, {
-        description: `Progress: ${Math.round(getProgress(recommendedModel) || 0)}%`
+    if (isDownloading(modelName)) {
+      toast.info(`${modelName} is already downloading`, {
+        description: `Progress: ${Math.round(getProgress(modelName) || 0)}%`
       });
       return;
     }
@@ -716,7 +723,7 @@ export function ModelSettingsModal({
       // The download will be tracked by the global context via events
       // Progress toasts are shown automatically by OllamaDownloadContext
       await invoke('pull_ollama_model', {
-        modelName: recommendedModel,
+        modelName,
         endpoint
       });
 
@@ -741,9 +748,18 @@ export function ModelSettingsModal({
         });
         // Update the installation status flag
         setOllamaNotInstalled(true);
+      } else {
+        toast.error(`Failed to download ${modelName}`, {
+          description: errorMsg,
+        });
       }
       // Other errors are handled by the context
     }
+  };
+
+  // Function to download recommended model
+  const downloadRecommendedModel = async () => {
+    await downloadOllamaModel('gemma3:1b');
   };
 
   // Function to delete Ollama model
@@ -820,10 +836,10 @@ export function ModelSettingsModal({
                 setError('');
 
                 // Save current provider's model to localStorage before switching
-                const map = JSON.parse(localStorage.getItem('providerModelMap') || '{}');
+                const map = readStringMap('providerModelMap');
                 if (modelConfig.model) {
                   map[modelConfig.provider] = modelConfig.model;
-                  localStorage.setItem('providerModelMap', JSON.stringify(map));
+                  writeStringMap('providerModelMap', map);
                 }
 
                 // Try to restore cached model for the new provider
@@ -1205,6 +1221,46 @@ export function ModelSettingsModal({
                 </div>
               )}
             </div>
+            {!ollamaEndpointChanged && models.length > 0 && (
+              <div className="mb-4 rounded-md border border-indigo-100 bg-indigo-50/60 p-3">
+                <div className="flex items-center justify-between mb-2">
+                  <h5 className="text-xs font-bold text-indigo-900">推荐本地总结模型</h5>
+                  <span className="text-[10px] text-indigo-500">点击下载，供不同总结模型对比测试</span>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {RECOMMENDED_LOCAL_MODELS.map((m) => {
+                    const progress = getProgress(m.name);
+                    const downloading = isDownloading(m.name);
+                    return (
+                      <button
+                        key={m.name}
+                        type="button"
+                        onClick={() => downloadOllamaModel(m.name)}
+                        disabled={downloading}
+                        className="group flex flex-col items-start rounded-md border border-indigo-200 bg-white px-3 py-2 text-left hover:border-indigo-400 disabled:opacity-60"
+                      >
+                        <span className="flex items-center gap-1.5 text-sm font-semibold text-indigo-900">
+                          {m.label}
+                          {m.badge && <span className="rounded bg-indigo-600 px-1 py-px text-[9px] font-bold text-white">{m.badge}</span>}
+                        </span>
+                        <span className="text-[11px] text-slate-500">{m.note}</span>
+                        <span className="mt-1 text-[10px] font-mono text-slate-400">
+                          {downloading ? `下载中 ${Math.round(progress || 0)}%` : m.name}
+                        </span>
+                        {downloading && (
+                          <span className="mt-1 block h-1 w-full overflow-hidden rounded bg-indigo-100">
+                            <span
+                              className="block h-full bg-indigo-500 transition-all"
+                              style={{ width: `${progress || 0}%` }}
+                            />
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
             {models.length > 0 && (
               <div className="mb-4">
                 <Input

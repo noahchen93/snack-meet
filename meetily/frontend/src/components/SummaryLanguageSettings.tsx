@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Globe, Pin } from 'lucide-react';
+import { Globe, Pin, Check } from 'lucide-react';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { LanguagePickerPopover } from '@/components/LanguagePickerPopover';
 import { useRecentLanguages } from '@/hooks/useRecentLanguages';
@@ -19,12 +19,33 @@ export function SummaryLanguageSettings() {
     <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm relative">
       <div className="flex items-center gap-2 mb-2">
         <Globe size={18} className="text-gray-500" />
-        <h3 className="text-lg font-semibold text-gray-900">Summary Language</h3>
+        <h3 className="text-lg font-semibold text-gray-900">总结输出语言</h3>
       </div>
       <p className="text-sm text-gray-600 mb-4">
-        Pin one language as the default for new meetings. Unpinned languages remain as
-        quick-switch options in the summary generator. Auto uses the dominant transcript language.
+        设为“始终使用”后，所有新生成和重新生成的总结都会强制使用该语言，不再跟随会议语言。
       </p>
+
+      <div className="grid grid-cols-3 gap-2 mb-5">
+        {[
+          { code: null, label: '自动识别' },
+          { code: 'zh', label: '始终中文' },
+          { code: 'en', label: '始终 English' },
+        ].map(({ code, label }) => {
+          const selected = pinned === code;
+          return (
+            <button
+              key={label}
+              type="button"
+              onClick={() => setPinned(code)}
+              className={`flex items-center justify-center gap-1.5 rounded-lg border px-3 py-2 text-sm font-medium transition ${
+                selected ? 'border-indigo-300 bg-indigo-50 text-indigo-700' : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+              }`}
+            >
+              {selected && <Check size={14} />}{label}
+            </button>
+          );
+        })}
+      </div>
 
       <div className="flex flex-wrap items-center gap-2">
         {recents.map((code) => {
@@ -93,8 +114,8 @@ export function SummaryLanguageSettings() {
 
       <p className="text-xs text-gray-400 mt-3">
         {pinned
-          ? `Default: ${labelForCode(pinned)} - click it again to unset. Max 5 quick-switch options.`
-          : 'Click any language to set it as your default. Max 5 quick-switch options.'}
+          ? `始终使用：${labelForCode(pinned)}。此设置会覆盖每个会议的自动语言判断。`
+          : '自动模式会根据会议转写内容判断总结语言。'}
       </p>
     </div>
   );

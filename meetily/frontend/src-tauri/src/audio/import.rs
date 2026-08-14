@@ -86,6 +86,7 @@ pub struct ImportResult {
     pub title: String,
     pub segments_count: usize,
     pub duration_seconds: f64,
+    pub folder_path: String,
 }
 
 /// Error during import
@@ -115,6 +116,7 @@ pub fn is_import_in_progress() -> bool {
 /// Cancel ongoing import
 pub fn cancel_import() {
     IMPORT_CANCELLED.store(true, Ordering::SeqCst);
+    crate::audio::retranscription::cancel_retranscription();
 }
 
 /// Validate an audio file and return its info using metadata-only approach
@@ -256,17 +258,19 @@ pub async fn start_import<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
 ) -> Result<ImportResult> {
+    // Compatibility-only arguments for older callers; preparation no longer
+    // loads a local transcription provider.
+    let _ = (&language, &model, &provider);
     // Acquire guard - ensures flag is cleared even on panic/early return
     let _guard = ImportGuard::acquire().map_err(|e| anyhow!(e))?;
 
     // Reset cancellation flag
     IMPORT_CANCELLED.store(false, Ordering::SeqCst);
 
-    let use_parakeet = provider.as_deref() == Some("parakeet");
-    let result = run_import(app.clone(), source_path, title, language, model, provider).await;
-
-    // Unload the engine after the batch job (success, failure, or cancellation)
-    super::common::unload_engine_after_batch(use_parakeet).await;
+    // Imports are deliberately preparation-only.  The remote desktop performs
+    // transcription after this folder is synced, and this Mac later imports the
+    // resulting transcripts.json through scan_and_import_transcripts.
+    let result = run_import(app.clone(), source_path, title).await;
 
     // Guard will automatically clear flag on drop
     // No need for manual: IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
@@ -279,7 +283,8 @@ pub async fn start_import<R: Runtime>(
                     "meeting_id": res.meeting_id,
                     "title": res.title,
                     "segments_count": res.segments_count,
-                    "duration_seconds": res.duration_seconds
+                    "duration_seconds": res.duration_seconds,
+                    "folder_path": res.folder_path
                 }),
             );
         }
@@ -298,6 +303,85 @@ pub async fn start_import<R: Runtime>(
 
 /// Internal function to run import
 async fn run_import<R: Runtime>(
+    app: AppHandle<R>,
+    source_path: String,
+    title: String,
+) -> Result<ImportResult> {
+    let source = PathBuf::from(&source_path);
+    if !source.exists() {
+        return Err(anyhow!("Source file not found: {}", source.display()));
+    }
+
+    emit_progress(&app, "preparing", 5, "Creating sync folder...");
+    let base_folder = get_default_recordings_folder();
+    let meeting_folder = create_meeting_folder(&base_folder, &title, false)?;
+
+    if IMPORT_CANCELLED.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_dir_all(&meeting_folder);
+        return Err(anyhow!("Import cancelled"));
+    }
+
+    // Keep the original bytes and format. The remote transcription machine
+    // decides whether it needs to decode; this Mac only prepares a sync folder.
+    emit_progress(&app, "copying", 30, "Copying original audio file...");
+    let audio_filename = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("audio")
+        .to_string();
+    let destination = meeting_folder.join(&audio_filename);
+    let copy_source = source.clone();
+    tokio::task::spawn_blocking(move || std::fs::copy(copy_source, destination))
+        .await
+        .map_err(|e| anyhow!("Audio copy task failed: {}", e))?
+        .map_err(|e| anyhow!("Failed to copy original audio: {}", e))?;
+
+    let duration_seconds = extract_duration_from_metadata(&source).unwrap_or(0.0);
+
+    // Create an empty, pending meeting immediately. This makes the imported
+    // audio visible in Snack Meet now; the same row is filled or updated when
+    // local/remote transcription later writes transcripts.json.
+    let app_state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| anyhow!("App state not available"))?;
+    let meeting_id = create_meeting_with_transcripts(
+        app_state.db_manager.pool(),
+        &title,
+        &[],
+        meeting_folder.to_string_lossy().to_string(),
+        true,
+        None,
+    )
+    .await?;
+
+    write_prepared_import_metadata(
+        &meeting_folder,
+        &meeting_id,
+        &title,
+        duration_seconds,
+        &source,
+        &audio_filename,
+    )?;
+
+    emit_progress(
+        &app,
+        "complete",
+        100,
+        "Original audio prepared for remote transcription",
+    );
+    Ok(ImportResult {
+        meeting_id,
+        title,
+        segments_count: 0,
+        duration_seconds,
+        folder_path: meeting_folder.to_string_lossy().to_string(),
+    })
+}
+
+/// Legacy local-transcription pipeline retained temporarily for reference. New
+/// imports must use the preparation-only pipeline above.
+#[allow(dead_code)]
+async fn run_legacy_transcribing_import<R: Runtime>(
     app: AppHandle<R>,
     source_path: String,
     title: String,
@@ -360,7 +444,7 @@ async fn run_import<R: Runtime>(
 
     // Decode the audio file with progress updates
     let app_for_decode = app.clone();
-    let decode_progress = Box::new(move |progress: u32, msg: &str| {
+    let decode_progress = std::sync::Arc::new(move |progress: u32, msg: &str| {
         // Map decode progress: 15% + (progress * 0.05) to go from 15% to 20%
         let overall_progress = 15 + ((progress as f32 * 0.05) as u32);
         emit_progress(&app_for_decode, "decoding", overall_progress, msg);
@@ -389,7 +473,7 @@ async fn run_import<R: Runtime>(
 
     // Convert to 16kHz mono format with progress updates
     let app_for_resample = app.clone();
-    let resample_progress = Box::new(move |progress: u32, msg: &str| {
+    let resample_progress = std::sync::Arc::new(move |progress: u32, msg: &str| {
         // Map resample progress: 20% + (progress * 0.05) to go from 20% to 25%
         let overall_progress = 20 + ((progress as f32 * 0.05) as u32);
         emit_progress(&app_for_resample, "resampling", overall_progress, msg);
@@ -691,6 +775,7 @@ async fn run_import<R: Runtime>(
         title,
         segments_count: segments.len(),
         duration_seconds,
+        folder_path: meeting_folder.to_string_lossy().to_string(),
     })
 }
 
@@ -771,7 +856,11 @@ async fn update_meeting_transcripts(
         .await
         .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
 
-    info!("Updated meeting {} with {} transcripts", meeting_id, segments.len());
+    info!(
+        "Updated meeting {} with {} transcripts",
+        meeting_id,
+        segments.len()
+    );
     Ok(())
 }
 
@@ -883,7 +972,10 @@ async fn get_or_init_whisper<R: Runtime>(
                     .await
                     .map_err(|e| anyhow!("Failed to load model '{}': {}", target_model, e))?;
             } else {
-                info!("Whisper model '{}' already loaded concurrently", target_model);
+                info!(
+                    "Whisper model '{}' already loaded concurrently",
+                    target_model
+                );
             }
 
             Ok((e, target_model))
@@ -1042,6 +1134,38 @@ fn write_import_metadata(
     Ok(())
 }
 
+/// Metadata for a prepared import. `transcription_status` deliberately stays
+/// pending until the remote machine adds transcripts.json to this same folder.
+fn write_prepared_import_metadata(
+    folder: &Path,
+    meeting_id: &str,
+    title: &str,
+    duration_seconds: f64,
+    source_path: &Path,
+    audio_filename: &str,
+) -> Result<()> {
+    let metadata_path = folder.join("metadata.json");
+    let temp_path = folder.join(".metadata.json.tmp");
+    let now = chrono::Utc::now().to_rfc3339();
+    let json = serde_json::json!({
+        "version": "1.1",
+        "meeting_id": meeting_id,
+        "meeting_name": title,
+        "created_at": now,
+        "duration_seconds": duration_seconds,
+        "audio_file": audio_filename,
+        "source_file": source_path.file_name().and_then(|name| name.to_str()).unwrap_or("unknown"),
+        "source_format": source_path.extension().and_then(|ext| ext.to_str()).unwrap_or("unknown"),
+        "transcript_file": "transcripts.json",
+        "transcription_status": "pending",
+        "status": "prepared",
+        "source": "local-import"
+    });
+    std::fs::write(&temp_path, serde_json::to_string_pretty(&json)?)?;
+    std::fs::rename(&temp_path, &metadata_path)?;
+    Ok(())
+}
+
 // ============================================================================
 // Tauri Commands
 // ============================================================================
@@ -1093,6 +1217,228 @@ pub async fn select_and_validate_audio_command<R: Runtime>(
 pub async fn validate_audio_file_command(path: String) -> Result<AudioFileInfo, String> {
     info!("Validating audio file: {}", path);
     validate_audio_file(Path::new(&path)).map_err(|e| e.to_string())
+}
+
+/// Open a native multi-select file dialog and validate every chosen audio file.
+/// Used by batch import so users can queue several recordings at once.
+#[tauri::command]
+pub async fn select_and_validate_audio_files_command<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Vec<AudioFileInfo>, String> {
+    info!("Opening multi-select file dialog for audio import");
+
+    let app_clone = app.clone();
+    let paths = tokio::task::spawn_blocking(move || {
+        app_clone
+            .dialog()
+            .file()
+            .add_filter(
+                "Audio Files",
+                &AUDIO_EXTENSIONS.iter().map(|s| *s).collect::<Vec<_>>(),
+            )
+            .blocking_pick_files()
+    })
+    .await
+    .map_err(|e| format!("File dialog task failed: {}", e))?
+    .unwrap_or_default();
+
+    let mut validated = Vec::new();
+    for path in paths {
+        let path_str = path.to_string();
+        match validate_audio_file(Path::new(&path_str)) {
+            Ok(info) => validated.push(info),
+            Err(e) => {
+                warn!("Skipping invalid audio file {}: {}", path_str, e);
+            }
+        }
+    }
+
+    info!("Validated {} audio files for batch import", validated.len());
+    Ok(validated)
+}
+
+// ============================================================================
+// BATCH IMPORT
+// ============================================================================
+
+/// One file queued for batch import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchImportFile {
+    pub path: String,
+    pub title: String,
+}
+
+/// Acknowledged start of a batch import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchImportStarted {
+    pub message: String,
+    pub total: usize,
+}
+
+/// Per-file progress / boundary event for batch import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchImportProgress {
+    pub index: usize,
+    pub total: usize,
+    pub filename: String,
+}
+
+/// Per-file result after it has been imported (prepared).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchImportFileResult {
+    pub index: usize,
+    pub total: usize,
+    pub filename: String,
+    pub meeting_id: String,
+    pub title: String,
+    pub folder_path: String,
+}
+
+/// Per-file failure during batch import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchImportError {
+    pub index: usize,
+    pub total: usize,
+    pub filename: String,
+    pub error: String,
+}
+
+/// Final summary of a completed batch import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchImportComplete {
+    pub total: usize,
+    pub imported: usize,
+    pub failed: usize,
+}
+
+/// Import one or many audio files through one sequential queue. Every file uses
+/// the same preparation-only pipeline: preserve the original bytes, create the
+/// meeting folder/card and write metadata. Transcription remains an explicit
+/// follow-up action selected from the meeting UI.
+#[tauri::command]
+pub async fn start_batch_import_command<R: Runtime>(
+    app: AppHandle<R>,
+    files: Vec<BatchImportFile>,
+) -> Result<BatchImportStarted, String> {
+    if IMPORT_IN_PROGRESS.load(Ordering::SeqCst) {
+        return Err("Import already in progress".to_string());
+    }
+    if files.is_empty() {
+        return Err("没有选择任何音频文件".to_string());
+    }
+
+    let total = files.len();
+    info!("Starting batch import of {} files", total);
+    IMPORT_CANCELLED.store(false, Ordering::SeqCst);
+
+    tauri::async_runtime::spawn(async move {
+        // One guard covers the entire batch so a second import can't overlap.
+        let _guard = match ImportGuard::acquire() {
+            Ok(guard) => guard,
+            Err(e) => {
+                let _ = app.emit(
+                    "batch-import-error",
+                    BatchImportError {
+                        index: 0,
+                        total,
+                        filename: String::new(),
+                        error: e,
+                    },
+                );
+                return;
+            }
+        };
+
+        let mut imported = 0usize;
+        let mut failed = 0usize;
+
+        for (index, file) in files.iter().enumerate() {
+            if IMPORT_CANCELLED.load(Ordering::SeqCst) {
+                info!("Batch import cancelled at file {}", index);
+                for (cancelled_index, cancelled_file) in files.iter().enumerate().skip(index) {
+                    failed += 1;
+                    let cancelled_filename = Path::new(&cancelled_file.path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("audio")
+                        .to_string();
+                    let _ = app.emit(
+                        "batch-import-error",
+                        BatchImportError {
+                            index: cancelled_index,
+                            total,
+                            filename: cancelled_filename,
+                            error: "导入队列已取消".to_string(),
+                        },
+                    );
+                }
+                break;
+            }
+
+            let filename = Path::new(&file.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("audio")
+                .to_string();
+
+            let _ = app.emit(
+                "batch-import-progress",
+                BatchImportProgress {
+                    index,
+                    total,
+                    filename: filename.clone(),
+                },
+            );
+
+            match run_import(app.clone(), file.path.clone(), file.title.clone()).await {
+                Ok(result) => {
+                    imported += 1;
+                    let _ = app.emit(
+                        "batch-import-file-complete",
+                        BatchImportFileResult {
+                            index,
+                            total,
+                            filename,
+                            meeting_id: result.meeting_id,
+                            title: result.title,
+                            folder_path: result.folder_path,
+                        },
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    warn!("Batch import failed for {}: {}", file.path, e);
+                    let _ = app.emit(
+                        "batch-import-error",
+                        BatchImportError {
+                            index,
+                            total,
+                            filename,
+                            error: e.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+
+        info!(
+            "Batch import finished: {} imported, {} failed",
+            imported, failed
+        );
+        let _ = app.emit(
+            "batch-import-complete",
+            BatchImportComplete {
+                total,
+                imported,
+                failed,
+            },
+        );
+    });
+
+    Ok(BatchImportStarted {
+        message: "Batch import started".to_string(),
+        total,
+    })
 }
 
 /// Start importing an audio file (Beta gated using configContext.betaFeatures)
@@ -1183,7 +1529,10 @@ fn parse_transcripts_json(path: &Path) -> Result<Vec<crate::api::TranscriptSegme
         let audio_start_time = seg.get("audio_start_time").and_then(|v| v.as_f64());
         let audio_end_time = seg.get("audio_end_time").and_then(|v| v.as_f64());
         let duration = seg.get("duration").and_then(|v| v.as_f64());
-        let speaker = seg.get("speaker").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let speaker = seg
+            .get("speaker")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         // transcripts.id is a PRIMARY KEY. On-disk files often use generic ids
         // like "seg_0"/"seg_1" that collide across meetings (and with existing
         // rows), which makes the INSERT fail and rolls back the whole meeting.
@@ -1261,12 +1610,11 @@ pub async fn scan_and_import_transcripts(
 
     // Collect existing folder_path -> meeting_id so we can update a same-named
     // folder's transcripts instead of skipping it (re-transcription support).
-    let existing_rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT folder_path, id FROM meetings WHERE folder_path IS NOT NULL",
-    )
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| format!("Failed to query existing meetings: {}", e))?;
+    let existing_rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT folder_path, id FROM meetings WHERE folder_path IS NOT NULL")
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("Failed to query existing meetings: {}", e))?;
     let mut existing: std::collections::HashMap<String, String> =
         existing_rows.into_iter().collect();
 
@@ -1339,15 +1687,23 @@ pub async fn scan_and_import_transcripts(
                     // metadata.json) so previously-imported meetings also sort
                     // by when the call happened, not when they were imported.
                     if let Some(rec_created_at) = read_recording_created_at(&path) {
-                        let _ = sqlx::query("UPDATE meetings SET created_at = ? WHERE id = ? AND created_at > ?")
-                            .bind(rec_created_at)
-                            .bind(&meeting_id)
-                            .bind(rec_created_at)
-                            .execute(&pool)
-                            .await;
+                        let _ = sqlx::query(
+                            "UPDATE meetings SET created_at = ? WHERE id = ? AND created_at > ?",
+                        )
+                        .bind(rec_created_at)
+                        .bind(&meeting_id)
+                        .bind(rec_created_at)
+                        .execute(&pool)
+                        .await;
                     }
                     match update_meeting_transcripts(&pool, &meeting_id, &segments).await {
                         Ok(()) => {
+                            crate::library::restore_meeting_organization_from_metadata(
+                                &pool,
+                                &meeting_id,
+                                &path,
+                            )
+                            .await;
                             result.updated += 1;
                             result.imported_meetings.push(meeting_id);
                         }
@@ -1358,10 +1714,23 @@ pub async fn scan_and_import_transcripts(
                     }
                 } else {
                     let recording_created_at = read_recording_created_at(&path);
-                    match create_meeting_with_transcripts(&pool, &title, &segments, folder_path_str.clone(), true, recording_created_at)
-                        .await
+                    match create_meeting_with_transcripts(
+                        &pool,
+                        &title,
+                        &segments,
+                        folder_path_str.clone(),
+                        true,
+                        recording_created_at,
+                    )
+                    .await
                     {
                         Ok(meeting_id) => {
+                            crate::library::restore_meeting_organization_from_metadata(
+                                &pool,
+                                &meeting_id,
+                                &path,
+                            )
+                            .await;
                             result.imported += 1;
                             result.imported_meetings.push(meeting_id.clone());
                             existing.insert(folder_path_str, meeting_id);

@@ -1,14 +1,15 @@
 import { useCallback, RefObject } from 'react';
-import { save } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { Transcript, Summary } from '@/types';
 import { BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { toast } from 'sonner';
-import Analytics from '@/lib/analytics';
 
 interface UseExportMeetingProps {
-  meeting: any;
-  transcripts: Transcript[];
+  meeting: {
+    id: string;
+    title: string;
+    created_at: string;
+  };
   meetingTitle: string;
   aiSummary: Summary | null;
   blockNoteSummaryRef: RefObject<BlockNoteSummaryViewRef>;
@@ -16,12 +17,11 @@ interface UseExportMeetingProps {
 
 /**
  * Export a meeting (transcript + summary) to a Markdown file.
- * Uses the native save dialog to pick a destination, then writes via the
- * backend `save_transcript` command (std::fs write — no fs scope needed).
+ * The backend opens the native save dialog and writes only to the path that
+ * the user grants through that dialog.
  */
 export function useExportMeeting({
   meeting,
-  transcripts,
   meetingTitle,
   aiSummary,
   blockNoteSummaryRef,
@@ -59,20 +59,29 @@ export function useExportMeeting({
       summaryMarkdown = await blockNoteSummaryRef.current.getMarkdown();
     }
 
-    if (!summaryMarkdown && aiSummary && 'markdown' in aiSummary) {
-      summaryMarkdown = (aiSummary as any).markdown || '';
+    const summaryRecord = aiSummary as unknown as Record<string, unknown> | null;
+    if (!summaryMarkdown && typeof summaryRecord?.markdown === 'string') {
+      summaryMarkdown = summaryRecord.markdown;
     }
 
-    if (!summaryMarkdown && aiSummary) {
-      const sections = Object.entries(aiSummary)
+    if (!summaryMarkdown && summaryRecord) {
+      const sections = Object.entries(summaryRecord)
         .filter(([key]) => {
           return key !== 'markdown' && key !== 'summary_json' && key !== '_section_order' && key !== 'MeetingName';
         })
         .map(([, section]) => {
           if (section && typeof section === 'object' && 'title' in section && 'blocks' in section) {
-            const sectionTitle = `## ${section.title}\n\n`;
-            const sectionContent = section.blocks
-              .map((block: any) => `- ${block.content}`)
+            const candidate = section as { title: unknown; blocks: unknown };
+            if (typeof candidate.title !== 'string' || !Array.isArray(candidate.blocks)) return '';
+
+            const sectionTitle = `## ${candidate.title}\n\n`;
+            const sectionContent = candidate.blocks
+              .map((block: unknown) => {
+                if (!block || typeof block !== 'object' || !('content' in block)) return '';
+                const content = (block as { content: unknown }).content;
+                return typeof content === 'string' ? `- ${content}` : '';
+              })
+              .filter(Boolean)
               .join('\n');
             return sectionTitle + sectionContent;
           }
@@ -110,15 +119,6 @@ export function useExportMeeting({
         .replace(/[\\/:*?"<>|]/g, '-')
         .trim() || 'meeting';
 
-      const defaultPath = `${safeTitle}.md`;
-
-      const filePath = await save({
-        defaultPath,
-        filters: [{ name: 'Markdown', extensions: ['md'] }],
-      });
-
-      if (!filePath) return; // user cancelled
-
       // Build the full markdown document
       const lines: string[] = [];
       lines.push(`# ${meetingTitle || meeting.title || '未命名会议'}`);
@@ -151,16 +151,15 @@ export function useExportMeeting({
 
       const content = lines.join('\n');
 
-      await invoke('save_transcript', { filePath, content });
+      const filePath = await invoke<string | null>('save_transcript', {
+        suggestedName: safeTitle,
+        content,
+      });
+
+      if (!filePath) return; // user cancelled the native save dialog
 
       toast.success('会议已导出为 Markdown', {
         description: filePath,
-      });
-
-      await Analytics.trackFeatureUsedEnhanced('export_markdown', {
-        meeting_id: meeting.id,
-        has_summary: summaryMarkdown ? 'true' : 'false',
-        transcript_count: allTranscripts.length.toString(),
       });
     } catch (error) {
       console.error('❌ Failed to export meeting:', error);

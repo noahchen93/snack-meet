@@ -43,6 +43,17 @@ pub struct MessageContent {
     pub content: String,
 }
 
+// Native Ollama /api/chat response (stream=false)
+#[derive(Deserialize, Debug)]
+pub struct OllamaChatResponse {
+    pub message: OllamaMessageContent,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct OllamaMessageContent {
+    pub content: String,
+}
+
 // Claude-specific request structure
 #[derive(Debug, Serialize)]
 pub struct ClaudeRequest {
@@ -165,10 +176,9 @@ pub async fn generate_summary(
             let host = ollama_endpoint
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "http://localhost:11434".to_string());
-            (
-                format!("{}/v1/chat/completions", host),
-                header::HeaderMap::new(),
-            )
+            // Use the native /api/chat endpoint so we can pass num_ctx/num_predict options,
+            // which the OpenAI-compatible /v1/chat/completions endpoint ignores.
+            (format!("{}/api/chat", host), header::HeaderMap::new())
         }
         LLMProvider::CustomOpenAI => {
             let endpoint = custom_openai_endpoint
@@ -219,8 +229,37 @@ pub async fn generate_summary(
             .map_err(|_| "Invalid content type".to_string())?,
     );
 
+    // For Ollama, resolve runtime parameters (memory-aware context window,
+    // output cap, thinking toggle, timeout) before building the request.
+    let ollama_params = if provider == &LLMProvider::Ollama {
+        Some(crate::summary::ollama_params::resolve(model_name, ollama_endpoint).await)
+    } else {
+        None
+    };
+
     // Build request body based on provider
-    let request_body = if provider != &LLMProvider::Claude {
+    let request_body = if provider == &LLMProvider::Ollama {
+        let p = ollama_params.as_ref().expect("ollama params resolved");
+        serde_json::json!({
+            "model": model_name,
+            "stream": false,
+            "think": !p.disable_thinking,
+            "messages": vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: system_prompt.to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: user_prompt.to_string(),
+                }
+            ],
+            "options": {
+                "num_ctx": p.num_ctx,
+                "num_predict": p.num_predict,
+            }
+        })
+    } else if provider != &LLMProvider::Claude {
         // For CustomOpenAI, apply optional parameters if provided
         let (max_tokens_val, temperature_val, top_p_val) = if provider == &LLMProvider::CustomOpenAI
         {
@@ -264,11 +303,15 @@ pub async fn generate_summary(
     );
 
     // Send request with timeout and cancellation support
+    let request_timeout = ollama_params
+        .as_ref()
+        .map(|p| p.timeout)
+        .unwrap_or(REQUEST_TIMEOUT_DURATION);
     let request_future = client
         .post(api_url)
         .headers(headers)
         .json(&request_body)
-        .timeout(REQUEST_TIMEOUT_DURATION)
+        .timeout(request_timeout)
         .send();
 
     // Use tokio::select to race between cancellation and request completion
@@ -277,7 +320,7 @@ pub async fn generate_summary(
             result = request_future => {
                 result.map_err(|e| {
                     if e.is_timeout() {
-                        format!("LLM request timed out after 60 seconds")
+                        format!("LLM request timed out after {} seconds", request_timeout.as_secs())
                     } else {
                         format!("Failed to send request to LLM: {}", e)
                     }
@@ -290,7 +333,10 @@ pub async fn generate_summary(
     } else {
         request_future.await.map_err(|e| {
             if e.is_timeout() {
-                format!("LLM request timed out after 60 seconds")
+                format!(
+                    "LLM request timed out after {} seconds",
+                    request_timeout.as_secs()
+                )
             } else {
                 format!("Failed to send request to LLM: {}", e)
             }
@@ -320,6 +366,16 @@ pub async fn generate_summary(
             .ok_or("No content in LLM response")?
             .text
             .trim();
+        Ok(content.to_string())
+    } else if provider == &LLMProvider::Ollama {
+        let ollama_response = response
+            .json::<OllamaChatResponse>()
+            .await
+            .map_err(|e| format!("Failed to parse LLM response: {}", e))?;
+
+        info!("🐞 LLM Response received from Ollama");
+
+        let content = ollama_response.message.content.trim();
         Ok(content.to_string())
     } else {
         let chat_response = response

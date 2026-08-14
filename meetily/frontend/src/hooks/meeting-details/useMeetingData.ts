@@ -1,7 +1,8 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { Transcript, Summary } from '@/types';
-import { BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
-import { CurrentMeeting, useSidebar } from '@/components/Sidebar/SidebarProvider';
+import type { Summary } from '@/types';
+import type { BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
+import { useSidebar } from '@/components/Sidebar/SidebarProvider';
+import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
 import { invoke as invokeTauri } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 
@@ -142,11 +143,16 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
   }, [isTitleDirty, handleSaveMeetingTitle, aiSummary, handleSaveSummary]);
 
   // Update meeting title from external source (e.g., AI summary)
-  const updateMeetingTitle = useCallback((newTitle: string) => {
+  const updateMeetingTitle = useCallback(async (newTitle: string) => {
     console.log('📝 Updating meeting title to:', newTitle);
+    await invokeTauri('api_save_meeting_title', {
+      meetingId: meeting.id,
+      title: newTitle,
+    });
     setMeetingTitle(newTitle);
+    setIsTitleDirty(false);
     const updatedMeetings = sidebarMeetings.map((m: CurrentMeeting) =>
-      m.id === meeting.id ? { id: m.id, title: newTitle } : m
+      m.id === meeting.id ? { ...m, title: newTitle } : m
     );
     setMeetings(updatedMeetings);
     setCurrentMeeting({ id: meeting.id, title: newTitle });

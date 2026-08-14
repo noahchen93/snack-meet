@@ -72,7 +72,8 @@ pub fn start_transcription_task<R: Runtime>(
 
         // Create parallel workers for faster processing while preserving ALL chunks
         const NUM_WORKERS: usize = 1; // Serial processing ensures transcripts emit in chronological order
-        let (work_sender, work_receiver) = tokio::sync::mpsc::unbounded_channel::<TranscriptionChunk>();
+        let (work_sender, work_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<TranscriptionChunk>();
         let work_receiver = Arc::new(tokio::sync::Mutex::new(work_receiver));
 
         // Track completion: AtomicU64 for chunks queued, AtomicU64 for chunks completed
@@ -157,7 +158,8 @@ pub fn start_transcription_task<R: Runtime>(
                             }
 
                             let chunk_timestamp = chunk.audio.timestamp;
-                            let chunk_duration = chunk.audio.data.len() as f64 / chunk.audio.sample_rate as f64;
+                            let chunk_duration =
+                                chunk.audio.data.len() as f64 / chunk.audio.sample_rate as f64;
 
                             // Transcribe with provider-agnostic approach
                             match transcribe_chunk_with_provider(
@@ -224,7 +226,8 @@ pub fn start_transcription_task<R: Runtime>(
                                         // This decouples the transcription worker from direct RECORDING_MANAGER access
 
                                         // Emit transcript update with NEW recording-relative timestamps
-                                        let speaker_str = speaker_label.as_ref().map(|s| s.as_str().to_string());
+                                        let speaker_str =
+                                            speaker_label.as_ref().map(|s| s.as_str().to_string());
 
                                         let update = TranscriptUpdate {
                                             text: transcript,

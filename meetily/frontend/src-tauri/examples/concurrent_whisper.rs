@@ -21,13 +21,19 @@ async fn main() -> anyhow::Result<()> {
     // Load the first model as the live/current model.
     println!("Loading medium-q5_0 as current model...");
     engine.load_model("medium-q5_0").await?;
-    assert_eq!(engine.get_current_model().await, Some("medium-q5_0".to_string()));
+    assert_eq!(
+        engine.get_current_model().await,
+        Some("medium-q5_0".to_string())
+    );
     assert!(engine.is_model_loaded_named("medium-q5_0").await);
 
     // Load a second model concurrently; the current model should stay unchanged.
     println!("Loading large-v3-turbo-q5_0 concurrently...");
     engine.load_model_concurrent("large-v3-turbo-q5_0").await?;
-    assert_eq!(engine.get_current_model().await, Some("medium-q5_0".to_string()));
+    assert_eq!(
+        engine.get_current_model().await,
+        Some("medium-q5_0".to_string())
+    );
     assert!(engine.is_model_loaded_named("medium-q5_0").await);
     assert!(engine.is_model_loaded_named("large-v3-turbo-q5_0").await);
 

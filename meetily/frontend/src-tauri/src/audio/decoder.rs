@@ -8,6 +8,10 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
@@ -24,7 +28,7 @@ const FFMPEG_ONLY_EXTENSIONS: &[&str] = &["mkv", "webm", "wma"];
 
 /// Progress callback for long-running operations
 /// Returns current progress (0-100) and a message
-pub type ProgressCallback = Box<dyn Fn(u32, &str) + Send>;
+pub type ProgressCallback = Arc<dyn Fn(u32, &str) + Send + Sync>;
 
 /// Decoded audio data from a file
 #[derive(Debug, Clone)]
@@ -125,7 +129,8 @@ impl DecodedAudio {
 ///
 /// Chunked resampling with optional progress callback.
 ///
-/// Resamples `input` in parallel 60-second chunks via [`rayon`], then merges
+/// Resamples `input` in parallel 60-second chunks via [`rayon`], reporting each
+/// completed chunk immediately, then merges
 /// the results sequentially with a 100ms cross-fade to eliminate discontinuities
 /// at chunk boundaries. Each chunk's [`resample`] call is independent and
 /// CPU-bound, making this ideal for data parallelism.
@@ -166,11 +171,21 @@ fn chunked_resample_with_progress(
     );
 
     // Resample all chunks in parallel — each is independent and CPU-bound
+    let completed_chunks = Arc::new(AtomicUsize::new(0));
     let resampled_chunks: Vec<Result<Vec<f32>>> = chunk_ranges
         .par_iter()
         .map(|&(chunk_start, chunk_end)| {
             let chunk = &input[chunk_start..chunk_end];
-            resample(chunk, from_rate, to_rate)
+            let result = resample(chunk, from_rate, to_rate);
+            let completed = completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(callback) = &progress_callback {
+                let progress_pct = ((completed as f64 / total_chunks as f64) * 100.0) as u32;
+                callback(
+                    progress_pct,
+                    &format!("Converting audio format: {completed}/{total_chunks} minutes"),
+                );
+            }
+            result
         })
         .collect();
 
@@ -210,20 +225,8 @@ fn chunked_resample_with_progress(
             }
         }
 
-        if let Some(callback) = &progress_callback {
-            let progress_pct = ((chunk_idx + 1) as f64 / total_chunks as f64) * 100.0;
-            if (chunk_idx + 1) % 10 == 0 || chunk_idx + 1 == total_chunks {
-                info!(
-                    "Resampling progress: {}/{} chunks ({:.0}%)",
-                    chunk_idx + 1,
-                    total_chunks,
-                    progress_pct
-                );
-            }
-            callback(
-                progress_pct as u32,
-                &format!("Resampling audio: {:.0}%", progress_pct),
-            );
+        if (chunk_idx + 1) % 10 == 0 || chunk_idx + 1 == total_chunks {
+            info!("Merged resampling chunk {}/{}", chunk_idx + 1, total_chunks);
         }
     }
 

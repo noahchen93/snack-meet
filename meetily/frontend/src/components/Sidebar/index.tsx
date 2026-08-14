@@ -1,15 +1,14 @@
 'use client';
 
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, Upload } from 'lucide-react';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, Upload, Folder, FolderPlus, Inbox, Star, Archive, BarChart3 } from 'lucide-react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
-import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
+import type { CurrentMeeting, LibraryCollection } from '@/components/Sidebar/SidebarProvider';
 import { ConfirmationModal } from '../ConfirmationModel/confirmation-modal';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { SettingTabs } from '../SettingTabs';
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
-import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
@@ -30,6 +29,7 @@ import Logo from '../Logo';
 import Info from '../Info';
 import { ComplianceNotification } from '../ComplianceNotification';
 import { Input } from '../ui/input';
+import { useLocale } from '@/contexts/LocaleContext';
 
 interface SidebarItem {
   id: string;
@@ -55,13 +55,19 @@ const Sidebar: React.FC = () => {
     isSearching,
     meetings,
     setMeetings,
-    serverAddress
+    serverAddress,
+    collections,
+    refetchCollections,
+    libraryView,
+    setLibraryView,
+    refetchMeetings,
   } = useSidebar();
 
   // Get recording state from RecordingStateContext (single source of truth)
   const { isRecording } = useRecordingState();
   const { openImportDialog } = useImportDialog();
   const { betaFeatures } = useConfig();
+  const { t } = useLocale();
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['meetings']));
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [showModelSettings, setShowModelSettings] = useState(false);
@@ -77,6 +83,10 @@ const Sidebar: React.FC = () => {
     model: 'medium-q5_0',
   });
   const [settingsSaveSuccess, setSettingsSaveSuccess] = useState<boolean | null>(null);
+  const [collectionEditor, setCollectionEditor] = useState<{ mode: 'create' | 'rename'; id?: string; value: string } | null>(null);
+  const [collectionDeleteTarget, setCollectionDeleteTarget] = useState<LibraryCollection | null>(null);
+  const [savingCollection, setSavingCollection] = useState(false);
+  const [dragOverCollection, setDragOverCollection] = useState<string | null>(null);
 
   // State for edit modal
   const [editModalState, setEditModalState] = useState<{ isOpen: boolean; meetingId: string | null; currentTitle: string }>({
@@ -201,9 +211,6 @@ const Sidebar: React.FC = () => {
       // Emit event to sync other components
       const { emit } = await import('@tauri-apps/api/event');
       await emit('model-config-updated', config);
-
-      // Track settings change
-      await Analytics.trackSettingsChanged('model_config', `${config.provider}_${config.model}`);
     } catch (error) {
       console.error('Error saving model config:', error);
       setSettingsSaveSuccess(false);
@@ -228,10 +235,6 @@ const Sidebar: React.FC = () => {
 
 
       setSettingsSaveSuccess(true);
-
-      // Track settings change
-      const transcriptConfigToSave = updatedConfig || transcriptModelConfig;
-      await Analytics.trackSettingsChanged('transcript_config', `${transcriptConfigToSave.provider}_${transcriptConfigToSave.model}`);
     } catch (error) {
       console.error('Failed to save transcript config:', error);
       setSettingsSaveSuccess(false);
@@ -337,9 +340,6 @@ const Sidebar: React.FC = () => {
       const updatedMeetings = meetings.filter((m: CurrentMeeting) => m.id !== itemId);
       setMeetings(updatedMeetings);
 
-      // Track meeting deletion
-      Analytics.trackMeetingDeleted(itemId);
-
       // Show success toast
       toast.success(deleteFiles ? "Meeting and files deleted" : "Meeting deleted successfully", {
         description: deleteFiles
@@ -406,9 +406,6 @@ const Sidebar: React.FC = () => {
         setCurrentMeeting({ id: meetingId, title: newTitle });
       }
 
-      // Track the edit
-      Analytics.trackButtonClick('edit_meeting_title', 'sidebar');
-
       toast.success("Meeting title updated successfully");
 
       // Close modal and reset state
@@ -425,6 +422,70 @@ const Sidebar: React.FC = () => {
   const handleEditCancel = () => {
     setEditModalState({ isOpen: false, meetingId: null, currentTitle: '' });
     setEditingTitle('');
+  };
+
+  const openLibraryView = (view: Parameters<typeof setLibraryView>[0]) => {
+    setLibraryView(view);
+    if (pathname !== '/') router.push('/');
+  };
+
+  const saveCollection = async () => {
+    if (!collectionEditor?.value.trim() || savingCollection) return;
+    setSavingCollection(true);
+    try {
+      if (collectionEditor.mode === 'create') {
+        const created = await invoke<LibraryCollection>('api_create_collection', {
+          name: collectionEditor.value,
+          color: null,
+        });
+        setLibraryView({ kind: 'collection', collectionId: created.id });
+      } else {
+        await invoke('api_rename_collection', {
+          collectionId: collectionEditor.id,
+          name: collectionEditor.value,
+        });
+      }
+      await refetchCollections();
+      setCollectionEditor(null);
+    } catch (error) {
+      toast.error(t('folderSaveFailed'), { description: String(error) });
+    } finally {
+      setSavingCollection(false);
+    }
+  };
+
+  const deleteCollection = async () => {
+    if (!collectionDeleteTarget || savingCollection) return;
+    setSavingCollection(true);
+    try {
+      await invoke('api_delete_collection', { collectionId: collectionDeleteTarget.id });
+      if (libraryView.kind === 'collection' && libraryView.collectionId === collectionDeleteTarget.id) {
+        setLibraryView({ kind: 'inbox' });
+      }
+      await Promise.all([refetchCollections(), refetchMeetings()]);
+      setCollectionDeleteTarget(null);
+      toast.success(t('folderDeletedMeetingsMoved'));
+    } catch (error) {
+      toast.error(t('folderDeleteFailed'), { description: String(error) });
+    } finally {
+      setSavingCollection(false);
+    }
+  };
+
+  const dropMeetingsIntoCollection = async (event: React.DragEvent, collectionId: string | null) => {
+    event.preventDefault();
+    setDragOverCollection(null);
+    try {
+      const raw = event.dataTransfer.getData('application/x-snack-meeting-ids') || event.dataTransfer.getData('text/plain');
+      const meetingIds = JSON.parse(raw) as string[];
+      if (!Array.isArray(meetingIds) || meetingIds.length === 0) return;
+      await invoke('api_move_meetings_to_collection', { meetingIds, collectionId });
+      await Promise.all([refetchMeetings(), refetchCollections()]);
+      toast.success(t('moveSuccess'));
+    } catch (error) {
+      console.error('Failed to drop meetings into folder:', error);
+      toast.error(t('moveFailed'), { description: String(error) });
+    }
   };
 
   const toggleFolder = (folderId: string) => {
@@ -456,11 +517,24 @@ const Sidebar: React.FC = () => {
     const isHomePage = pathname === '/';
     const isMeetingPage = pathname?.includes('/meeting-details');
     const isSettingsPage = pathname === '/settings';
+    const isAnalyticsPage = pathname === '/analytics';
 
     return (
       <TooltipProvider>
         <div className="flex flex-col items-center space-y-4 mt-4">
           <Logo isCollapsed={isCollapsed} />
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                onClick={() => router.push('/analytics')}
+                className={`p-2 rounded-lg transition-colors duration-150 ${isAnalyticsPage ? 'bg-indigo-50' : 'hover:bg-gray-100'}`}
+              >
+                <BarChart3 className="w-5 h-5 text-gray-600" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right"><p>{t('corpusAnalytics')}</p></TooltipContent>
+          </Tooltip>
 
           <Tooltip>
             <TooltipTrigger asChild>
@@ -504,10 +578,10 @@ const Sidebar: React.FC = () => {
                   className="p-2 rounded-lg transition-colors duration-150 hover:bg-blue-100 bg-blue-50"
                 >
                   <Upload className="w-5 h-5 text-blue-600" />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="right">
-                <p>Import Audio</p>
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right">
+                <p>{t('importAudio')}</p>
               </TooltipContent>
             </Tooltip>
           )}
@@ -652,7 +726,9 @@ const Sidebar: React.FC = () => {
               {/* Show transcript match snippet if available */}
               {hasTranscriptMatch && (
                 <div className="mt-1 ml-8 text-xs text-gray-500 bg-yellow-50 p-1.5 rounded border border-yellow-100 line-clamp-2">
-                  <span className="font-medium text-yellow-600">Match:</span> {matchingResult.matchContext}
+                  <span className="font-medium text-yellow-600">
+                    匹配于{matchingResult.matchTypes?.includes('summary') ? '总结' : matchingResult.matchTypes?.includes('transcript') ? '转写全文' : matchingResult.matchTypes?.includes('original') ? '原文' : '标题'}：
+                  </span> {matchingResult.matchContext}
                 </div>
               )}
             </div>
@@ -708,11 +784,12 @@ const Sidebar: React.FC = () => {
           <div className="flex-shrink-0">
             {!isCollapsed && (
               <div
-                onClick={() => router.push('/')}
-                className="p-3  text-lg font-semibold items-center hover:bg-gray-100 h-10   flex mx-3 mt-3 rounded-lg cursor-pointer"
+                onClick={() => openLibraryView({ kind: 'all' })}
+                className={`p-3 text-lg font-semibold items-center h-10 flex mx-3 mt-3 rounded-lg cursor-pointer ${libraryView.kind === 'all' ? 'bg-indigo-50 text-indigo-700' : 'hover:bg-gray-100'}`}
               >
                 <Home className="w-4 h-4 mr-2" />
-                <span>Home</span>
+                <span>{t('allMeetings')}</span>
+                <span className="ml-auto text-xs font-normal text-gray-400">{meetings.filter((meeting) => !meeting.isArchived).length}</span>
               </div>
             )}
           </div>
@@ -720,8 +797,98 @@ const Sidebar: React.FC = () => {
           {/* Content area */}
           <div className="flex-1 flex flex-col min-h-0">
             {renderCollapsedIcons()}
-            {/* Meeting list is now shown on the Home page (merged), so the
-                sidebar only keeps the Home navigation. */}
+            {!isCollapsed && (
+              <div className="flex-1 overflow-y-auto px-3 py-2">
+                <button
+                  onClick={() => openLibraryView({ kind: 'inbox' })}
+                  onDragOver={(event) => { event.preventDefault(); setDragOverCollection('inbox'); }}
+                  onDragLeave={() => setDragOverCollection(null)}
+                  onDrop={(event) => void dropMeetingsIntoCollection(event, null)}
+                  className={`flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm ${dragOverCollection === 'inbox' ? 'bg-indigo-100 ring-2 ring-indigo-300' : libraryView.kind === 'inbox' ? 'bg-indigo-50 text-indigo-700' : 'text-gray-600 hover:bg-gray-50'}`}
+                >
+                  <Inbox className="h-4 w-4" />
+                  <span>{t('inbox')}</span>
+                  <span className="ml-auto text-xs text-gray-400">{meetings.filter((meeting) => !meeting.isArchived && !meeting.collectionId).length}</span>
+                </button>
+                <button
+                  onClick={() => openLibraryView({ kind: 'favorites' })}
+                  className={`flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm ${libraryView.kind === 'favorites' ? 'bg-indigo-50 text-indigo-700' : 'text-gray-600 hover:bg-gray-50'}`}
+                >
+                  <Star className="h-4 w-4" />
+                  <span>{t('favorites')}</span>
+                  <span className="ml-auto text-xs text-gray-400">{meetings.filter((meeting) => !meeting.isArchived && meeting.isFavorite).length}</span>
+                </button>
+                <button
+                  onClick={() => openLibraryView({ kind: 'archived' })}
+                  className={`flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm ${libraryView.kind === 'archived' ? 'bg-indigo-50 text-indigo-700' : 'text-gray-600 hover:bg-gray-50'}`}
+                >
+                  <Archive className="h-4 w-4" />
+                  <span>{t('archived')}</span>
+                  <span className="ml-auto text-xs text-gray-400">{meetings.filter((meeting) => meeting.isArchived).length}</span>
+                </button>
+                <button
+                  onClick={() => router.push('/analytics')}
+                  className={`mt-2 flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm ${pathname === '/analytics' ? 'bg-indigo-50 text-indigo-700' : 'text-gray-600 hover:bg-gray-50'}`}
+                >
+                  <BarChart3 className="h-4 w-4" />
+                  <span>{t('corpusAnalytics')}</span>
+                </button>
+
+                <div className="mt-5 mb-1 flex items-center justify-between px-2">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-gray-400">{t('myFolders')}</span>
+                  <button
+                    onClick={() => setCollectionEditor({ mode: 'create', value: '' })}
+                    className="rounded p-1 text-gray-400 hover:bg-indigo-50 hover:text-indigo-600"
+                    aria-label={t('newFolder')}
+                    title={t('newFolder')}
+                  >
+                    <FolderPlus className="h-4 w-4" />
+                  </button>
+                </div>
+                <div className="space-y-0.5">
+                  {collections.map((collection) => {
+                    const active = libraryView.kind === 'collection' && libraryView.collectionId === collection.id;
+                    return (
+                      <div key={collection.id} className={`group flex items-center rounded-lg ${dragOverCollection === collection.id ? 'bg-indigo-100 text-indigo-700 ring-2 ring-indigo-300' : active ? 'bg-indigo-50 text-indigo-700' : 'text-gray-600 hover:bg-gray-50'}`}>
+                        <button
+                          onClick={() => openLibraryView({ kind: 'collection', collectionId: collection.id })}
+                          onDragOver={(event) => { event.preventDefault(); setDragOverCollection(collection.id); }}
+                          onDragLeave={() => setDragOverCollection(null)}
+                          onDrop={(event) => void dropMeetingsIntoCollection(event, collection.id)}
+                          className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left text-sm"
+                        >
+                          <Folder className="h-4 w-4 shrink-0" />
+                          <span className="truncate">{collection.name}</span>
+                          <span className="ml-auto text-xs text-gray-400">{collection.meetingCount}</span>
+                        </button>
+                        <button
+                          onClick={() => setCollectionEditor({ mode: 'rename', id: collection.id, value: collection.name })}
+                          className="hidden rounded p-1 text-gray-400 hover:text-indigo-600 group-hover:block"
+                          aria-label={t('renameFolder')}
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          onClick={() => setCollectionDeleteTarget(collection)}
+                          className="mr-1 hidden rounded p-1 text-gray-400 hover:text-red-600 group-hover:block"
+                          aria-label={t('deleteFolder')}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                  {collections.length === 0 && (
+                    <button
+                      onClick={() => setCollectionEditor({ mode: 'create', value: '' })}
+                      className="w-full rounded-lg border border-dashed border-gray-200 px-3 py-3 text-xs text-gray-400 hover:border-indigo-300 hover:text-indigo-600"
+                    >
+                      + {t('createFirstFolder')}
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -753,7 +920,7 @@ const Sidebar: React.FC = () => {
                 className="w-full flex items-center justify-center px-3 py-2 mt-1 text-sm font-medium text-gray-700 bg-blue-100 hover:bg-blue-200 rounded-lg transition-colors shadow-sm"
               >
                 <Upload className="w-4 h-4 mr-2" />
-                <span>Import Audio</span>
+                <span>{t('importAudio')}</span>
               </button>
             )}
 
@@ -832,6 +999,40 @@ const Sidebar: React.FC = () => {
             >
               Save
             </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!collectionEditor} onOpenChange={(open) => { if (!open) setCollectionEditor(null); }}>
+        <DialogContent className="sm:max-w-[400px]">
+          <DialogTitle>{collectionEditor?.mode === 'rename' ? t('renameFolder') : t('newFolder')}</DialogTitle>
+          <div className="py-3">
+            <label htmlFor="collection-name" className="mb-2 block text-sm font-medium text-gray-700">{t('folderName')}</label>
+            <input
+              id="collection-name"
+              value={collectionEditor?.value || ''}
+              onChange={(event) => setCollectionEditor((current) => current ? { ...current, value: event.target.value } : null)}
+              onKeyDown={(event) => { if (event.key === 'Enter') void saveCollection(); }}
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              autoFocus
+            />
+          </div>
+          <DialogFooter>
+            <button onClick={() => setCollectionEditor(null)} className="rounded-lg px-4 py-2 text-sm text-gray-600 hover:bg-gray-100">{t('cancel')}</button>
+            <button onClick={saveCollection} disabled={savingCollection || !collectionEditor?.value.trim()} className="rounded-lg bg-indigo-600 px-4 py-2 text-sm text-white disabled:opacity-40">{savingCollection ? t('saving') : t('save')}</button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!collectionDeleteTarget} onOpenChange={(open) => { if (!open) setCollectionDeleteTarget(null); }}>
+        <DialogContent className="sm:max-w-[420px]">
+          <DialogTitle>{t('deleteFolder')}</DialogTitle>
+          <p className="py-3 text-sm leading-6 text-gray-600">
+            {t('deleteFolderDescription').replace('{name}', collectionDeleteTarget?.name || '')}
+          </p>
+          <DialogFooter>
+            <button onClick={() => setCollectionDeleteTarget(null)} className="rounded-lg px-4 py-2 text-sm text-gray-600 hover:bg-gray-100">{t('cancel')}</button>
+            <button onClick={deleteCollection} disabled={savingCollection} className="rounded-lg bg-red-600 px-4 py-2 text-sm text-white disabled:opacity-40">{t('deleteFolderOnly')}</button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

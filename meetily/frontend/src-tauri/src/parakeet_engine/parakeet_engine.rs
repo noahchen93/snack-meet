@@ -143,11 +143,8 @@ impl ParakeetEngine {
                 current_dir.join("models").join("parakeet")
             } else {
                 // Production mode
-                dirs::data_dir()
-                    .or_else(|| dirs::home_dir())
+                crate::product_paths::data_subdir("models")
                     .ok_or_else(|| anyhow!("Could not find system data directory"))?
-                    .join("Meetily")
-                    .join("models")
                     .join("parakeet")
             }
         };
@@ -642,8 +639,9 @@ impl ParakeetEngine {
         let base_url = if model_name.contains("-v2-") {
             "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v2-onnx/resolve/main"
         } else {
-            // Default to v3 for v3 models
-            "https://meetily.towardsgeneralintelligence.com/models/parakeet-tdt-0.6b-v3-onnx"
+            // Download directly from the model author's repository. Snack Meet
+            // does not depend on the former upstream project's model proxy.
+            "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
         };
 
         // Determine which files to download based on quantization

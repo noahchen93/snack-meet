@@ -1,8 +1,8 @@
 //! Meeting-window auto-detection — a port of Snack Record's `MeetingReminderMonitor`
-//! (snack-record/Sources/main.m) into meetily's Rust backend.
+//! from the retired capture prototype into Snack Meet's Rust backend.
 //!
 //! This module detects meetings by combining meeting-app window transitions with a scoped
-//! ScreenCaptureKit audio-activity probe. It does NOT persist probe audio — meetily's own
+//! ScreenCaptureKit audio-activity probe. It does NOT persist probe audio — Snack Meet's own
 //! capture pipeline handles recording. When a meeting starts (or ends), it emits Tauri
 //! events and lets the frontend drive `start_recording` / `stop_recording` and summarization.
 //!
@@ -31,12 +31,24 @@ use crate::meeting_audio_probe::{self, AudioProbeHandle};
 const POLL_INTERVAL: Duration = Duration::from_millis(800);
 const START_COOLDOWN: Duration = Duration::from_secs(600); // 10 min after a declined start prompt
 const STOP_COOLDOWN: Duration = Duration::from_secs(10); // short gap after a recording ends
-const MEETING_END_STABLE_POLLS: u8 = 5; // ~4 seconds of a missing meeting window
+const MICROPHONE_END_STABLE_POLLS: u8 = 8; // ~6.4s; protects muted meetings without window access
+const GENERIC_MICROPHONE_END_STABLE_POLLS: u8 = 5; // ~4s for sessions with no meeting window
+const MEETING_WINDOW_END_STABLE_POLLS: u8 = 4; // ~3.2s; a missing meeting window is high confidence
 const CANDIDATE_STABLE_POLLS: u8 = 1;
 const MICROPHONE_TRIGGER_POLLS: u8 = 1;
 const AUDIO_TRIGGER_MS: u64 = 1_000;
 const SILENT_FALLBACK_POLLS: u8 = 4;
-const MICROPHONE_WHITELIST_PREFIXES: &[&str] = &["now.typeless"];
+// Voice input methods are not meetings. Typeless and WeChat Input Method must
+// never become microphone-triggered recording candidates. The WeChat bundle
+// spelling differs by distribution/version, so use the stable Tencent input
+// method prefixes rather than one exact bundle id.
+const MICROPHONE_WHITELIST_PREFIXES: &[&str] = &[
+    "now.typeless",
+    "com.tencent.inputmethod.wetype",
+    "com.tencent.WeChatInputMethod",
+    "com.tencent.WXInputMethod",
+    "com.tencent.weixin.inputmethod",
+];
 const MICROPHONE_INFRASTRUCTURE_BUNDLES: &[&str] = &["com.apple.CoreSpeech"];
 // Voice-messaging apps use the microphone both for live calls AND for short,
 // hold-to-talk voice messages. Requiring sustained mic use (~5 s) lets us detect
@@ -116,6 +128,7 @@ pub struct MeetingDetector {
     pub recorded_bundle: Option<String>,
     pub stop_prompted_for_bundle: Option<String>,
     meeting_end_polls: u8,
+    meeting_window_end_polls: u8,
     pub cooldown_until: Option<Instant>,
     candidate_signature: Option<String>,
     candidate_stable_polls: u8,
@@ -259,7 +272,7 @@ fn window_suggests_meeting(bundle: &str, title: &str, width: f64, height: f64) -
 
 /// Returns every window in the current shareable content. Empty on permission
 /// error or fetch failure.
-async fn fetch_windows() -> Vec<WindowInfo> {
+async fn fetch_windows() -> Option<Vec<WindowInfo>> {
     let content = match sc::ShareableContent::current().await {
         Ok(c) => c,
         Err(e) => {
@@ -267,7 +280,7 @@ async fn fetch_windows() -> Vec<WindowInfo> {
                 "SCShareableContent fetch failed (screen-recording permission?): {}",
                 e
             );
-            return Vec::new();
+            return None;
         }
     };
     let windows = content.windows();
@@ -287,7 +300,7 @@ async fn fetch_windows() -> Vec<WindowInfo> {
             height: size.height as f64,
         });
     }
-    out
+    Some(out)
 }
 
 /// Bundle ids of monitored apps that are currently running (main.m:2175).
@@ -332,6 +345,34 @@ fn active_non_whitelisted_input_bundles() -> Vec<String> {
     filter_active_input_bundles(active)
 }
 
+async fn emit_meeting_ended<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &DetectorState,
+    bundle_id: &str,
+    reason: &str,
+) {
+    let mut detector = state.lock().await;
+    detector.recording_active = false;
+    detector.recorded_bundle = None;
+    detector.stop_prompted_for_bundle = None;
+    detector.meeting_end_polls = 0;
+    detector.meeting_window_end_polls = 0;
+    detector.cooldown_until = Some(Instant::now() + STOP_COOLDOWN);
+    drop(detector);
+
+    info!(
+        "meeting ended; emitting meeting-ended({}) bundle={}",
+        reason, bundle_id
+    );
+    let _ = app.emit(
+        "meeting-ended",
+        MeetingEnded {
+            reason: reason.to_string(),
+            bundle_id: Some(bundle_id.to_string()),
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Poll loop + state machine
 // ---------------------------------------------------------------------------
@@ -370,81 +411,74 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
         // when the mic is released. WeChat/WhatsApp run continuously, so "running"
         // alone cannot signal the end — we must watch mic use instead.
         let is_voice_call = VOICE_CALL_APPS.contains(&rb.as_str());
-        let source_still_active = if is_voice_call {
-            active_non_whitelisted_input_bundles().contains(rb)
-        } else if monitored_recording {
-            running.contains(rb)
+        let microphone_active = active_non_whitelisted_input_bundles().contains(rb);
+
+        if monitored_recording && !running.contains(rb) {
+            emit_meeting_ended(app, state.inner(), rb, "app-exit").await;
+            return;
+        }
+
+        // Voice calls and generic microphone-triggered sessions have no reliable
+        // meeting window. Debounce microphone release instead of stopping on a
+        // single CoreAudio poll.
+        if is_voice_call || !monitored_recording {
+            let mut detector = state.lock().await;
+            detector.meeting_end_polls = if microphone_active {
+                0
+            } else {
+                detector.meeting_end_polls.saturating_add(1)
+            };
+            detector.meeting_window_end_polls = 0;
+            let should_stop = detector.meeting_end_polls >= GENERIC_MICROPHONE_END_STABLE_POLLS;
+            drop(detector);
+            if should_stop {
+                emit_meeting_ended(app, state.inner(), rb, "microphone-released").await;
+            }
+            return;
+        }
+
+        // Keep the window and microphone debounce independent. A brief mic
+        // release while muted must not accumulate with a transient window scan,
+        // while a genuinely closed Tencent meeting window should stop quickly
+        // even if Tencent keeps its CoreAudio input process alive.
+        let meeting_window_present = if has_screen_permission {
+            fetch_windows().await.map(|windows| {
+                windows.iter().any(|window| {
+                    &window.bundle == rb
+                        && window_suggests_meeting(
+                            &window.bundle,
+                            &window.title,
+                            window.width,
+                            window.height,
+                        )
+                })
+            })
         } else {
-            active_non_whitelisted_input_bundles().contains(rb)
+            None
         };
-        if !source_still_active {
-            // App exited or call mic released → auto-stop (no dialog).
-            let mut det = state.lock().await;
-            det.recording_active = false;
-            det.recorded_bundle = None;
-            det.stop_prompted_for_bundle = None;
-            det.meeting_end_polls = 0;
-            det.cooldown_until = Some(Instant::now() + STOP_COOLDOWN);
-            info!(
-                "meeting app exited; emitting meeting-ended(app-exit) bundle={}",
-                rb
-            );
-            let _ = app.emit(
-                "meeting-ended",
-                MeetingEnded {
-                    reason: "app-exit".into(),
-                    bundle_id: Some(rb.clone()),
-                },
-            );
-            return;
-        }
-        // For voice-calling apps, mic release is the natural end signal; there is
-        // no meeting window to inspect.
-        if is_voice_call {
-            return;
-        }
-        // For a non-meeting voice-input app, microphone release is the natural
-        // end signal; there is no meeting window to inspect.
-        if !monitored_recording {
-            return;
-        }
-        // Without Screen Recording permission we cannot inspect windows; rely on
-        // the app still running (already checked above) and skip the window check.
-        if !has_screen_permission {
-            return;
-        }
-        let windows = fetch_windows().await;
-        let still_meeting = windows.iter().any(|w| {
-            &w.bundle == rb && window_suggests_meeting(&w.bundle, &w.title, w.width, w.height)
-        });
-        let mut det = state.lock().await;
-        if still_meeting {
-            // Window came back; reset the end debounce.
-            det.stop_prompted_for_bundle = None;
-            det.meeting_end_polls = 0;
+        let mut detector = state.lock().await;
+        detector.meeting_end_polls = if microphone_active {
+            0
         } else {
-            det.meeting_end_polls = det.meeting_end_polls.saturating_add(1);
-        }
-        if !still_meeting
-            && det.meeting_end_polls >= MEETING_END_STABLE_POLLS
-            && det.stop_prompted_for_bundle.as_deref() != Some(rb.as_str())
-        {
-            // Window has been gone for several consecutive polls while the app
-            // stays open (for example Tencent Meeting returns to its home page).
-            // Treat that as the meeting ending and let the frontend save/stop.
-            det.stop_prompted_for_bundle = Some(rb.clone());
-            info!(
-                "meeting window absent for {} polls; emitting meeting-ended(window-gone) bundle={}",
-                det.meeting_end_polls,
-                rb
-            );
-            let _ = app.emit(
-                "meeting-ended",
-                MeetingEnded {
-                    reason: "window-gone".into(),
-                    bundle_id: Some(rb.clone()),
-                },
-            );
+            detector.meeting_end_polls.saturating_add(1)
+        };
+        detector.meeting_window_end_polls = match meeting_window_present {
+            Some(false) => detector.meeting_window_end_polls.saturating_add(1),
+            Some(true) | None => 0,
+        };
+        let window_ended = detector.meeting_window_end_polls >= MEETING_WINDOW_END_STABLE_POLLS;
+        // Only use microphone release by itself when window state is unavailable.
+        // With a visible meeting window, mic release usually just means mute.
+        let microphone_ended = meeting_window_present.is_none()
+            && detector.meeting_end_polls >= MICROPHONE_END_STABLE_POLLS;
+        drop(detector);
+        if window_ended || microphone_ended {
+            let reason = if window_ended {
+                "window-gone"
+            } else {
+                "microphone-released"
+            };
+            emit_meeting_ended(app, state.inner(), rb, reason).await;
         }
         return;
     }
@@ -472,7 +506,7 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
     let windows = if running.is_empty() || !has_screen_permission {
         Vec::new()
     } else {
-        fetch_windows().await
+        fetch_windows().await.unwrap_or_default()
     };
     let meeting_window = windows.iter().find(|w| {
         running.contains(&w.bundle)
@@ -641,9 +675,7 @@ pub async fn start_detector<R: Runtime>(app: &AppHandle<R>) -> Result<(), String
     // detector still catches meeting apps that grab the mic (腾讯会议 etc.).
     let has_screen = preflight_screen_capture();
     if !has_screen {
-        warn!(
-            "meeting detector starting without Screen Recording permission (mic-only detection)"
-        );
+        warn!("meeting detector starting without Screen Recording permission (mic-only detection)");
     }
 
     let state = app.state::<DetectorState>();
@@ -719,12 +751,14 @@ pub async fn set_recording_active<R: Runtime>(
         det.recorded_bundle = bundle_id;
         det.stop_prompted_for_bundle = None;
         det.meeting_end_polls = 0;
+        det.meeting_window_end_polls = 0;
         det.cooldown_until = None;
         det.cooldown_signature = None;
     } else {
         det.recorded_bundle = None;
         det.stop_prompted_for_bundle = None;
         det.meeting_end_polls = 0;
+        det.meeting_window_end_polls = 0;
         det.candidate_signature = None;
         det.candidate_stable_polls = 0;
         det.microphone_active_polls = 0;

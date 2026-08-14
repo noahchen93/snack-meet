@@ -1,11 +1,12 @@
 // External trigger module - allows other apps to trigger an audio import
-// by launching Meetily with `--import <path> [--title <title>] [--language <xx>] [--model <id>] [--provider whisper|parakeet]`.
+// by launching Snack Meet with `--import <path> [--title <title>]`. The imported
+// file is prepared for remote transcription; it is not transcribed locally.
 
 use log::{error as log_error, info as log_info};
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
-const TRACE_FILE: &str = "/tmp/meetily-trigger.log";
+const TRACE_FILE: &str = "/tmp/snack-meet-trigger.log";
 
 fn trace(msg: &str) {
     use std::io::Write;
@@ -61,30 +62,12 @@ pub fn trigger_import_from_args<R: Runtime>(app: &AppHandle<R>, args: &[String])
     );
 
     let app_handle = app.clone();
-    let is_parakeet = provider.as_deref() == Some("parakeet");
     trace(&format!(
         "trigger_import_from_args: spawn task path={} model={:?} provider={:?}",
         source_path, model, provider
     ));
     tauri::async_runtime::spawn(async move {
-        if !is_parakeet {
-            let mut waited_ms = 0;
-            while waited_ms < 60_000 {
-                let engine_ready = {
-                    let guard = crate::whisper_engine::commands::WHISPER_ENGINE
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    guard.is_some()
-                };
-                if engine_ready {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                waited_ms += 500;
-            }
-            trace(&format!("engine wait finished, waited_ms={}", waited_ms));
-        }
-        trace("calling start_import...");
+        trace("calling preparation-only import...");
         match crate::audio::import::start_import(
             app_handle.clone(),
             source_path,
@@ -97,17 +80,16 @@ pub fn trigger_import_from_args<R: Runtime>(app: &AppHandle<R>, args: &[String])
         {
             Ok(result) => {
                 trace(&format!(
-                    "import complete: meeting_id={} title={} segments={}",
-                    result.meeting_id, result.title, result.segments_count
+                    "audio prepared: meeting_id={} title={} folder={}",
+                    result.meeting_id, result.title, result.folder_path
                 ));
                 log_info!(
-                    "External import complete: meeting_id={} title={} segments={} duration={:.0}s",
+                    "External import prepared: meeting_id={} title={} folder={} duration={:.0}s",
                     result.meeting_id,
                     result.title,
-                    result.segments_count,
+                    result.folder_path,
                     result.duration_seconds
                 );
-                auto_summarize_meeting(app_handle.clone(), result.meeting_id.clone()).await;
                 let _ = app_handle.emit("external-import-complete", ());
             }
             Err(e) => {

@@ -13,6 +13,11 @@ pub struct MeetingModel {
     pub is_imported: bool,
     #[serde(default)]
     pub is_read: bool,
+    pub collection_id: Option<String>,
+    #[serde(default)]
+    pub is_archived: bool,
+    #[serde(default)]
+    pub is_favorite: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
@@ -102,6 +107,10 @@ pub struct Setting {
     #[sqlx(rename = "customOpenAIConfig")]
     #[serde(rename = "customOpenAIConfig")]
     pub custom_openai_config: Option<String>,
+    /// Global user-defined summary system prompt applied to every meeting summary
+    #[sqlx(rename = "summarySystemPrompt")]
+    #[serde(rename = "summarySystemPrompt")]
+    pub summary_system_prompt: Option<String>,
 }
 
 impl Setting {

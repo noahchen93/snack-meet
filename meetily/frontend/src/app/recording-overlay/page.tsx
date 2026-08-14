@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { emit } from '@tauri-apps/api/event';
+import { emit, listen } from '@tauri-apps/api/event';
 import { appDataDir } from '@tauri-apps/api/path';
 import { getCurrentWindow, Window } from '@tauri-apps/api/window';
 import { Mic2, Pause, Play, Radio, SquareArrowOutUpRight, Square } from 'lucide-react';
@@ -46,8 +46,28 @@ export default function RecordingOverlayPage() {
   useEffect(() => {
     sync();
     const timer = setInterval(sync, 500);
+    let unlistenCaptureStopped: (() => void) | undefined;
+    listen('recording-capture-stopped', () => {
+      wasRecording.current = false;
+      setEnded(true);
+      setState(previous => previous ? {
+        ...previous,
+        is_recording: false,
+        is_paused: false,
+        is_active: false,
+      } : previous);
+      if (hideTimer.current) clearTimeout(hideTimer.current);
+      hideTimer.current = setTimeout(() => {
+        getCurrentWindow().hide().catch(() => undefined);
+      }, 1800);
+    }).then(unlisten => {
+      unlistenCaptureStopped = unlisten;
+    }).catch(error => {
+      console.warn('[Recording overlay] Could not listen for capture stop:', error);
+    });
     return () => {
       clearInterval(timer);
+      unlistenCaptureStopped?.();
       if (hideTimer.current) clearTimeout(hideTimer.current);
     };
   }, [sync]);

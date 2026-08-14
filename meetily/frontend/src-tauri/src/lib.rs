@@ -1,6 +1,7 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex as StdMutex;
+use tauri_plugin_dialog::DialogExt;
 // Removed unused import
 
 // Performance optimization: Conditional logging macros for hot paths
@@ -28,10 +29,6 @@ macro_rules! perf_trace {
     ($($arg:tt)*) => {};
 }
 
-// Make these macros available to other modules
-pub(crate) use perf_debug;
-pub(crate) use perf_trace;
-
 // Re-export async logging macros for external use (removed due to macro conflicts)
 
 // Declare audio module
@@ -39,12 +36,14 @@ pub mod analytics;
 pub mod anthropic;
 pub mod api;
 pub mod audio;
+pub mod batch;
 pub mod config;
 pub mod console_utils;
 pub mod copilot;
 pub mod database;
 pub mod external_trigger;
 pub mod groq;
+pub mod library;
 mod meeting_audio_probe;
 pub mod meeting_detector;
 pub mod notifications;
@@ -53,6 +52,9 @@ pub mod onboarding;
 pub mod openai;
 pub mod openrouter;
 pub mod parakeet_engine;
+pub(crate) mod product_paths;
+mod recording_overlay;
+pub mod speaker;
 pub mod state;
 pub mod summary;
 pub mod tray;
@@ -70,33 +72,30 @@ use tokio::sync::RwLock;
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
 
 // Global language preference storage (default to "auto-translate" for automatic translation to English)
-static LANGUAGE_PREFERENCE: std::sync::LazyLock<StdMutex<String>> =
-    std::sync::LazyLock::new(|| StdMutex::new("auto-translate".to_string()));
+static LANGUAGE_PREFERENCE: once_cell::sync::Lazy<StdMutex<String>> =
+    once_cell::sync::Lazy::new(|| StdMutex::new("auto-translate".to_string()));
 
 #[derive(Debug, Deserialize)]
 struct RecordingArgs {
     save_path: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
-struct TranscriptionStatus {
-    chunks_in_queue: usize,
-    is_processing: bool,
-    last_activity_ms: u64,
-}
-
 /// Derive the (start, end) RFC3339 window for an auto-scan from the configured
 /// mode. "all" -> (None, None); "today" -> [00:00 today, now); "custom" ->
 /// [auto_scan_start, auto_scan_end). Returns (None, None) if no filtering.
-fn scan_time_window(prefs: &audio::recording_preferences::RecordingPreferences) -> (Option<String>, Option<String>) {
+fn scan_time_window(
+    prefs: &audio::recording_preferences::RecordingPreferences,
+) -> (Option<String>, Option<String>) {
     let mode = prefs.auto_scan_mode.as_deref().unwrap_or("all");
     match mode {
         "today" => {
             let now = Utc::now();
-            let start = now
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .and_then(|naive| naive.and_utc().to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into());
+            let start = now.date_naive().and_hms_opt(0, 0, 0).and_then(|naive| {
+                naive
+                    .and_utc()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    .into()
+            });
             let end = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             (start, Some(end))
         }
@@ -234,40 +233,72 @@ async fn is_recording() -> bool {
 }
 
 #[tauri::command]
-fn get_transcription_status() -> TranscriptionStatus {
-    TranscriptionStatus {
-        chunks_in_queue: 0,
-        is_processing: false,
-        last_activity_ms: 0,
-    }
+async fn get_transcription_status() -> audio::recording_commands::TranscriptionStatus {
+    audio::recording_commands::get_transcription_status().await
 }
 
 #[tauri::command]
-fn read_audio_file(file_path: String) -> Result<Vec<u8>, String> {
-    match std::fs::read(&file_path) {
-        Ok(data) => Ok(data),
-        Err(e) => Err(format!("Failed to read audio file: {}", e)),
+async fn save_transcript<R: Runtime>(
+    app: AppHandle<R>,
+    suggested_name: String,
+    content: String,
+) -> Result<Option<String>, String> {
+    // The backend owns the native save dialog. The webview can provide a file
+    // name and document content, but it cannot write to an arbitrary path.
+    let safe_stem = suggested_name
+        .trim_end_matches(".md")
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            _ => character,
+        })
+        .collect::<String>();
+    let safe_stem = safe_stem.trim();
+    let file_name = if safe_stem.is_empty() {
+        "meeting.md".to_string()
+    } else {
+        format!("{safe_stem}.md")
+    };
+
+    let Some(selected) = app
+        .dialog()
+        .file()
+        .set_title("Export meeting")
+        .set_file_name(file_name)
+        .add_filter("Markdown", &["md"])
+        .blocking_save_file()
+    else {
+        return Ok(None);
+    };
+
+    let mut file_path = selected
+        .into_path()
+        .map_err(|error| format!("Invalid export path: {error}"))?;
+    if file_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("md")
+    {
+        file_path.set_extension("md");
     }
-}
 
-#[tauri::command]
-async fn save_transcript(file_path: String, content: String) -> Result<(), String> {
-    log_info!("Saving transcript to: {}", file_path);
-
-    // Ensure parent directory exists
-    if let Some(parent) = std::path::Path::new(&file_path).parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory: {}", e))?;
+    let parent = file_path
+        .parent()
+        .ok_or_else(|| "The selected export path has no parent directory".to_string())?;
+    if !parent.is_dir() {
+        return Err("The selected export directory no longer exists".to_string());
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(&file_path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("Refusing to overwrite a symlink or non-file target".to_string());
         }
     }
 
-    // Write content to file
+    log_info!("Saving exported transcript to: {}", file_path.display());
     std::fs::write(&file_path, content)
-        .map_err(|e| format!("Failed to write transcript: {}", e))?;
+        .map_err(|error| format!("Failed to write transcript: {error}"))?;
 
-    log_info!("Transcript saved successfully");
-    Ok(())
+    Ok(Some(file_path.to_string_lossy().into_owned()))
 }
 
 // Audio level monitoring commands
@@ -299,8 +330,6 @@ async fn stop_audio_level_monitoring() -> Result<(), String> {
 async fn is_audio_level_monitoring() -> bool {
     audio::simple_level_monitor::is_monitoring()
 }
-
-// Analytics commands are now handled by analytics::commands module
 
 // Whisper commands are now handled by whisper_engine::commands module
 
@@ -411,7 +440,10 @@ pub fn run() {
         .format_timestamp_millis()
         .try_init();
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
         .with_writer(std::io::stderr)
         .try_init();
     log::set_max_level(log::LevelFilter::Info);
@@ -437,8 +469,6 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
         .manage(whisper_engine::parallel_commands::ParallelProcessorState::new())
         .manage(Arc::new(RwLock::new(
             None::<notifications::manager::NotificationManager<tauri::Wry>>,
@@ -453,6 +483,20 @@ pub fn run() {
             // Initialize system tray
             if let Err(e) = tray::create_tray(_app.handle()) {
                 log::error!("Failed to create system tray: {}", e);
+            }
+
+            // Configure the hidden recording indicator up front. The frontend
+            // repeats this immediately before showing it because macOS may
+            // rebuild window ordering after a fullscreen/Space transition.
+            if let Err(error) =
+                recording_overlay::configure_recording_overlay_at_startup(_app.handle())
+            {
+                log::warn!("Failed to configure recording overlay: {}", error);
+            }
+            if let Err(error) =
+                recording_overlay::configure_recording_prompt_at_startup(_app.handle())
+            {
+                log::warn!("Failed to configure recording prompt: {}", error);
             }
 
             // Initialize notification system with proper defaults
@@ -589,7 +633,10 @@ pub fn run() {
                 let save_folder = prefs.save_folder.to_string_lossy().to_string();
                 if !save_folder.is_empty() {
                     if let Err(e) = audio::import::scan_and_import_transcripts(
-                        scan_app, save_folder, None, None,
+                        scan_app,
+                        save_folder,
+                        None,
+                        None,
                     )
                     .await
                     {
@@ -654,33 +701,7 @@ pub fn run() {
             stop_recording,
             is_recording,
             get_transcription_status,
-            read_audio_file,
             save_transcript,
-            analytics::commands::init_analytics,
-            analytics::commands::disable_analytics,
-            analytics::commands::track_event,
-            analytics::commands::identify_user,
-            analytics::commands::track_meeting_started,
-            analytics::commands::track_recording_started,
-            analytics::commands::track_recording_stopped,
-            analytics::commands::track_meeting_deleted,
-            analytics::commands::track_settings_changed,
-            analytics::commands::track_feature_used,
-            analytics::commands::is_analytics_enabled,
-            analytics::commands::start_analytics_session,
-            analytics::commands::end_analytics_session,
-            analytics::commands::track_daily_active_user,
-            analytics::commands::track_user_first_launch,
-            analytics::commands::is_analytics_session_active,
-            analytics::commands::track_summary_generation_started,
-            analytics::commands::track_summary_generation_completed,
-            analytics::commands::track_summary_regenerated,
-            analytics::commands::track_model_changed,
-            analytics::commands::track_custom_prompt_used,
-            analytics::commands::track_meeting_ended,
-            analytics::commands::track_analytics_enabled,
-            analytics::commands::track_analytics_disabled,
-            analytics::commands::track_analytics_transparency_viewed,
             whisper_engine::commands::whisper_init,
             whisper_engine::commands::whisper_get_available_models,
             whisper_engine::commands::whisper_load_model,
@@ -763,6 +784,18 @@ pub fn run() {
             anthropic::anthropic::get_anthropic_models,
             groq::groq::get_groq_models,
             api::api_get_meetings,
+            analytics::api_get_tag_dashboard,
+            analytics::api_rename_tag,
+            analytics::api_delete_tag,
+            analytics::api_analyze_corpus,
+            analytics::api_get_corpus_ai_status,
+            library::api_list_collections,
+            library::api_create_collection,
+            library::api_rename_collection,
+            library::api_delete_collection,
+            library::api_move_meetings_to_collection,
+            library::api_set_meeting_archived,
+            library::api_set_meeting_favorite,
             api::api_search_transcripts,
             api::api_get_profile,
             api::api_save_profile,
@@ -778,6 +811,7 @@ pub fn run() {
             api::api_delete_meeting,
             api::api_delete_meeting_with_files,
             api::api_delete_meetings,
+            api::api_delete_meeting_audio_files,
             api::api_get_meeting,
             api::api_get_meeting_metadata,
             api::api_mark_meeting_read,
@@ -804,6 +838,8 @@ pub fn run() {
             summary::commands::api_cancel_summary,
             // Smart meeting renaming (content-based Chinese title)
             copilot::smart_rename_meeting,
+            // AI Copilot chat against a meeting's transcript + summary
+            copilot::api_copilot_chat,
             // Template commands
             summary::template_commands::api_list_templates,
             summary::template_commands::api_get_template_details,
@@ -887,6 +923,20 @@ pub fn run() {
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
             audio::import::scan_and_import_transcripts,
+            audio::import::select_and_validate_audio_files_command,
+            audio::import::start_batch_import_command,
+            // Batch queue commands
+            batch::api_batch_process,
+            batch::api_cancel_batch,
+            batch::is_batch_in_progress,
+            // Summary global prompt commands
+            summary::commands::api_get_global_summary_prompt,
+            summary::commands::api_set_global_summary_prompt,
+            // Speaker commands
+            speaker::api_get_distinct_speakers,
+            speaker::api_update_transcript_speaker,
+            speaker::api_rename_speaker,
+            speaker::api_suggest_speaker_names,
             // Meeting-window auto-detector (fused Snack Record detection)
             external_trigger::auto_summarize_meeting_command,
             meeting_detector::meeting_detector_start,
@@ -896,6 +946,8 @@ pub fn run() {
             meeting_detector::meeting_detector_ui_ready,
             meeting_detector::preflight_screen_capture,
             meeting_detector::request_screen_capture,
+            recording_overlay::recording_overlay_ensure_frontmost,
+            recording_overlay::recording_prompt_ensure_frontmost,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

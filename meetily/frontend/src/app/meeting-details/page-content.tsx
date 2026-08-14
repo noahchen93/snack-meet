@@ -1,16 +1,35 @@
 "use client";
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import { ArrowLeft } from 'lucide-react';
+import dynamic from 'next/dynamic';
+import { ArrowLeft, ListChecks } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { Summary, SummaryResponse } from '@/types';
-import { useSidebar } from '@/components/Sidebar/SidebarProvider';
-import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { TranscriptPanel } from '@/components/MeetingDetails/TranscriptPanel';
-import { SummaryPanel } from '@/components/MeetingDetails/SummaryPanel';
-import { ModelConfig } from '@/components/ModelSettingsModal';
+import type { ModelConfig } from '@/components/ModelSettingsModal';
+
+const SummaryPanel = dynamic(
+  () => import('@/components/MeetingDetails/SummaryPanel').then((module) => module.SummaryPanel),
+  {
+    ssr: false,
+    loading: () => (
+      <div
+        className="flex flex-1 min-w-0 items-center justify-center bg-white text-sm text-gray-500"
+        role="status"
+        aria-live="polite"
+      >
+        正在加载总结…
+      </div>
+    ),
+  },
+);
+
+const CopilotChat = dynamic(
+  () => import('@/components/MeetingDetails/CopilotChat').then((module) => module.CopilotChat),
+  { ssr: false },
+);
 
 // Custom hooks
 import { useMeetingData } from '@/hooks/meeting-details/useMeetingData';
@@ -63,9 +82,8 @@ export default function PageContent({
 
   // Ref to store the modal open function from SummaryGeneratorButtonGroup
   const openModelSettingsRef = useRef<(() => void) | null>(null);
+  const autoGenerationStartedRef = useRef<string | null>(null);
 
-  // Sidebar context
-  const { serverAddress } = useSidebar();
   const router = useRouter();
 
   // Get model config from ConfigContext
@@ -125,6 +143,7 @@ export default function PageContent({
     setAiSummary: meetingData.setAiSummary,
     onOpenModelSettings: handleOpenModelSettings,
   });
+  const handleGenerateSummary = summaryGeneration.handleGenerateSummary;
 
   const copyOperations = useCopyOperations({
     meeting,
@@ -136,7 +155,6 @@ export default function PageContent({
 
   const exportMeeting = useExportMeeting({
     meeting,
-    transcripts: meetingData.transcripts,
     meetingTitle: meetingData.meetingTitle,
     aiSummary: meetingData.aiSummary,
     blockNoteSummaryRef: meetingData.blockNoteSummaryRef,
@@ -146,34 +164,48 @@ export default function PageContent({
     meeting,
   });
 
-  // Track page view
-  useEffect(() => {
-    Analytics.trackPageView('meeting_details');
-  }, []);
-
   // Auto-generate summary when flag is set
   useEffect(() => {
+    if (!shouldAutoGenerate || meetingData.transcripts.length === 0) return;
+
+    const generationKey = `${meeting.id}:${modelConfig.provider}:${modelConfig.model}`;
+    if (autoGenerationStartedRef.current === generationKey) return;
+    autoGenerationStartedRef.current = generationKey;
+
     let cancelled = false;
 
     const autoGenerate = async () => {
-      if (shouldAutoGenerate && meetingData.transcripts.length > 0 && !cancelled) {
+      try {
         console.log(`🤖 Auto-generating summary with ${modelConfig.provider}/${modelConfig.model}...`);
-        await summaryGeneration.handleGenerateSummary('');
+        await handleGenerateSummary('');
 
         // Notify parent that auto-generation is complete (only if not cancelled)
         if (onAutoGenerateComplete && !cancelled) {
           onAutoGenerateComplete();
         }
+      } catch (error) {
+        if (autoGenerationStartedRef.current === generationKey) {
+          autoGenerationStartedRef.current = null;
+        }
+        console.error('Auto summary generation failed:', error);
       }
     };
 
-    autoGenerate();
+    void autoGenerate();
 
     // Cleanup: cancel if component unmounts or meeting changes
     return () => {
       cancelled = true;
     };
-  }, [shouldAutoGenerate, meeting.id]); // Re-run if meeting changes
+  }, [
+    meeting.id,
+    meetingData.transcripts.length,
+    modelConfig.model,
+    modelConfig.provider,
+    onAutoGenerateComplete,
+    shouldAutoGenerate,
+    handleGenerateSummary,
+  ]);
 
   return (
     <motion.div
@@ -193,10 +225,19 @@ export default function PageContent({
           返回
         </button>
         <span className="text-sm font-medium text-gray-800 truncate">
-          {meeting.title || '会议记录'}
+          {meetingData.meetingTitle || '会议记录'}
         </span>
+        <button
+          onClick={() => router.push(`/?batch=${encodeURIComponent(meeting.id)}`)}
+          className="inline-flex items-center gap-1.5 ml-auto px-2.5 py-1.5 text-sm text-indigo-600 hover:bg-indigo-50 rounded-md transition-colors"
+          aria-label="批量处理"
+          title="回到首页，将此会议加入批量转写 / 批量总结队列"
+        >
+          <ListChecks className="w-4 h-4" />
+          批量处理
+        </button>
       </div>
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 flex-col overflow-hidden md:flex-row">
         <TranscriptPanel
           transcripts={meetingData.transcripts}
           customPrompt={customPrompt}
@@ -216,6 +257,7 @@ export default function PageContent({
           // Retranscription props
           meetingId={meeting.id}
           meetingFolderPath={meeting.folder_path}
+          audioPath={meeting.audio_path}
           onRefetchTranscripts={onRefetchTranscripts}
         />
         <SummaryPanel
@@ -238,7 +280,7 @@ export default function PageContent({
           modelConfig={modelConfig}
           setModelConfig={setModelConfig}
           onSaveModelConfig={handleSaveModelConfig}
-          onGenerateSummary={summaryGeneration.handleGenerateSummary}
+          onGenerateSummary={handleGenerateSummary}
           onStopGeneration={summaryGeneration.handleStopGeneration}
           customPrompt={customPrompt}
           summaryResponse={summaryResponse}
@@ -255,6 +297,8 @@ export default function PageContent({
           onOpenModelSettings={handleRegisterModalOpen}
         />
       </div>
+
+      <CopilotChat meetingId={meeting.id} />
     </motion.div>
   );
 }

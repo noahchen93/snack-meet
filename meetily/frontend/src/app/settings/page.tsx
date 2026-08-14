@@ -9,22 +9,26 @@ import { TranscriptSettings } from '@/components/TranscriptSettings';
 import { RecordingSettings } from '@/components/RecordingSettings';
 import { PreferenceSettings } from '@/components/PreferenceSettings';
 import { SummaryModelSettings } from '@/components/SummaryModelSettings';
+import { SummarySystemPromptSettings } from '@/components/SummarySystemPromptSettings';
 import { BetaSettings } from '@/components/BetaSettings';
 import { useConfig } from '@/contexts/ConfigContext';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
+import { useLocale } from '@/contexts/LocaleContext';
+import { LanguageToggle } from '@/components/LanguageToggle';
 
 // Tabs configuration (constant)
 const TABS = [
-  { value: 'general', label: 'General', icon: Settings2 },
-  { value: 'recording', label: 'Recordings', icon: Mic },
-  { value: 'Transcriptionmodels', label: 'Transcription', icon: DatabaseIcon },
-  { value: 'summaryModels', label: 'Summary', icon: SparkleIcon },
-  { value: 'beta', label: 'Beta', icon: FlaskConical }
+  { value: 'general', label: 'general', icon: Settings2 },
+  { value: 'recording', label: 'recordings', icon: Mic },
+  { value: 'Transcriptionmodels', label: 'transcription', icon: DatabaseIcon },
+  { value: 'summaryModels', label: 'summary', icon: SparkleIcon },
+  { value: 'beta', label: 'beta', icon: FlaskConical }
 ] as const;
 
 export default function SettingsPage() {
   const router = useRouter();
   const { transcriptModelConfig, setTranscriptModelConfig } = useConfig();
+  const { t } = useLocale();
 
   // Animation state for tabs
   const [activeTab, setActiveTab] = useState('general');
@@ -73,9 +77,10 @@ export default function SettingsPage() {
               className="flex items-center gap-2 text-gray-600 hover:text-gray-900 transition-colors"
             >
               <ArrowLeft className="w-5 h-5" />
-              <span>Back</span>
+              <span>{t('back')}</span>
             </button>
-            <h1 className="text-3xl font-bold">Settings</h1>
+            <h1 className="text-3xl font-bold">{t('settings')}</h1>
+            <LanguageToggle />
           </div>
         </div>
       </div>
@@ -96,7 +101,7 @@ export default function SettingsPage() {
                     className="flex items-center gap-2 px-6 py-4 bg-transparent rounded-none border-0 data-[state=active]:bg-transparent data-[state=active]:text-blue-600 data-[state=active]:shadow-none text-gray-600 hover:text-gray-900 relative z-10"
                   >
                     <Icon className="w-4 h-4" />
-                    {tab.label}
+                    {t(tab.label)}
                   </TabsTrigger>
                 );
               })}
@@ -123,6 +128,9 @@ export default function SettingsPage() {
             </TabsContent>
             <TabsContent value="summaryModels">
               <SummaryModelSettings />
+              <div className="mt-4">
+                <SummarySystemPromptSettings />
+              </div>
             </TabsContent>
             <TabsContent value="beta" className="mt-6">
               <BetaSettings />

@@ -2,7 +2,10 @@ import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Transcript, MeetingMetadata, PaginatedTranscriptsResponse, TranscriptSegmentData } from "@/types";
 
-const DEFAULT_PAGE_SIZE = 100;
+// Meeting playback needs the timestamp map available for smooth subtitle
+// following. 1000 segments covers typical multi-hour meetings while preserving
+// pagination for exceptionally large imports.
+const DEFAULT_PAGE_SIZE = 1000;
 
 interface UsePaginatedTranscriptsProps {
     meetingId: string | null;

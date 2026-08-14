@@ -128,6 +128,14 @@ export class RecordingService {
   }
 
   /**
+   * Listen for the early capture-stopped event. Audio streams and the
+   * microphone are already closed, while transcript flush/save may continue.
+   */
+  async onRecordingCaptureStopped(callback: () => void): Promise<UnlistenFn> {
+    return listen('recording-capture-stopped', callback);
+  }
+
+  /**
    * Listen for recording-paused event
    * @param callback - Function to call when recording is paused
    * @returns Promise that resolves to unlisten function

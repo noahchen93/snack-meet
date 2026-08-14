@@ -2,6 +2,48 @@ use crate::database::models::{Setting, TranscriptSetting};
 use crate::summary::CustomOpenAIConfig;
 use sqlx::SqlitePool;
 
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "app.snackmeet.credentials";
+
+#[cfg(target_os = "macos")]
+fn keychain_account(scope: &str, provider: &str) -> String {
+    format!("{scope}:{provider}")
+}
+
+#[cfg(target_os = "macos")]
+fn save_keychain_secret(scope: &str, provider: &str, secret: &str) -> Result<(), sqlx::Error> {
+    let account = keychain_account(scope, provider);
+    if secret.trim().is_empty() {
+        let _ = security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, &account);
+        return Ok(());
+    }
+    security_framework::passwords::set_generic_password(
+        KEYCHAIN_SERVICE,
+        &account,
+        secret.as_bytes(),
+    )
+    .map_err(|error| {
+        sqlx::Error::Protocol(
+            format!("Failed to store credential in macOS Keychain: {error}").into(),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn read_keychain_secret(scope: &str, provider: &str) -> Option<String> {
+    let account = keychain_account(scope, provider);
+    security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, &account)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|secret| !secret.trim().is_empty())
+}
+
+#[cfg(target_os = "macos")]
+fn delete_keychain_secret(scope: &str, provider: &str) {
+    let account = keychain_account(scope, provider);
+    let _ = security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, &account);
+}
+
 #[derive(serde::Deserialize, Debug)]
 pub struct SaveModelConfigRequest {
     pub provider: String,
@@ -93,6 +135,9 @@ impl SettingsRepository {
             }
         };
 
+        #[cfg(target_os = "macos")]
+        save_keychain_secret("summary", provider, api_key)?;
+
         let query = format!(
             r#"
             INSERT INTO settings (id, provider, model, whisperModel, "{}")
@@ -102,8 +147,49 @@ impl SettingsRepository {
             "#,
             api_key_column, api_key_column
         );
-        sqlx::query(&query).bind(api_key).execute(pool).await?;
+        #[cfg(target_os = "macos")]
+        let database_value: Option<&str> = None;
+        #[cfg(not(target_os = "macos"))]
+        let database_value = Some(api_key);
+        sqlx::query(&query)
+            .bind(database_value)
+            .execute(pool)
+            .await?;
 
+        Ok(())
+    }
+
+    /// Reads the global user-defined summary system prompt (unified style for all meetings).
+    pub async fn get_summary_system_prompt(
+        pool: &SqlitePool,
+    ) -> std::result::Result<Option<String>, sqlx::Error> {
+        let value: Option<String> =
+            sqlx::query_scalar("SELECT summarySystemPrompt FROM settings WHERE id = '1' LIMIT 1")
+                .fetch_optional(pool)
+                .await?;
+        Ok(value.filter(|v| !v.trim().is_empty()))
+    }
+
+    /// Saves (or clears) the global user-defined summary system prompt.
+    pub async fn save_summary_system_prompt(
+        pool: &SqlitePool,
+        prompt: &str,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let value = prompt.trim();
+        if value.is_empty() {
+            sqlx::query("UPDATE settings SET summarySystemPrompt = NULL WHERE id = '1'")
+                .execute(pool)
+                .await?;
+        } else {
+            sqlx::query(
+                "INSERT INTO settings (id, provider, model, whisperModel, summarySystemPrompt) \
+                 VALUES ('1', '', '', '', $1) \
+                 ON CONFLICT(id) DO UPDATE SET summarySystemPrompt = excluded.summarySystemPrompt",
+            )
+            .bind(value)
+            .execute(pool)
+            .await?;
+        }
         Ok(())
     }
 
@@ -131,11 +217,30 @@ impl SettingsRepository {
             }
         };
 
+        #[cfg(target_os = "macos")]
+        if let Some(secret) = read_keychain_secret("summary", provider) {
+            return Ok(Some(secret));
+        }
+
         let query = format!(
             "SELECT {} FROM settings WHERE id = '1' LIMIT 1",
             api_key_column
         );
-        let api_key = sqlx::query_scalar(&query).fetch_optional(pool).await?;
+        let api_key: Option<String> = sqlx::query_scalar(&query).fetch_optional(pool).await?;
+
+        // One-time migration for existing Snack Meet installations. The
+        // plaintext database column is cleared only after Keychain succeeds.
+        #[cfg(target_os = "macos")]
+        if let Some(ref secret) = api_key {
+            if !secret.trim().is_empty() {
+                save_keychain_secret("summary", provider, secret)?;
+                let clear_query = format!(
+                    "UPDATE settings SET {} = NULL WHERE id = '1'",
+                    api_key_column
+                );
+                sqlx::query(&clear_query).execute(pool).await?;
+            }
+        }
         Ok(api_key)
     }
 
@@ -190,6 +295,9 @@ impl SettingsRepository {
             }
         };
 
+        #[cfg(target_os = "macos")]
+        save_keychain_secret("transcription", provider, api_key)?;
+
         let query = format!(
             r#"
             INSERT INTO transcript_settings (id, provider, model, "{}")
@@ -201,7 +309,14 @@ impl SettingsRepository {
             crate::config::DEFAULT_PARAKEET_MODEL,
             api_key_column
         );
-        sqlx::query(&query).bind(api_key).execute(pool).await?;
+        #[cfg(target_os = "macos")]
+        let database_value: Option<&str> = None;
+        #[cfg(not(target_os = "macos"))]
+        let database_value = Some(api_key);
+        sqlx::query(&query)
+            .bind(database_value)
+            .execute(pool)
+            .await?;
 
         Ok(())
     }
@@ -224,11 +339,27 @@ impl SettingsRepository {
             }
         };
 
+        #[cfg(target_os = "macos")]
+        if let Some(secret) = read_keychain_secret("transcription", provider) {
+            return Ok(Some(secret));
+        }
+
         let query = format!(
             "SELECT {} FROM transcript_settings WHERE id = '1' LIMIT 1",
             api_key_column
         );
-        let api_key = sqlx::query_scalar(&query).fetch_optional(pool).await?;
+        let api_key: Option<String> = sqlx::query_scalar(&query).fetch_optional(pool).await?;
+        #[cfg(target_os = "macos")]
+        if let Some(ref secret) = api_key {
+            if !secret.trim().is_empty() {
+                save_keychain_secret("transcription", provider, secret)?;
+                let clear_query = format!(
+                    "UPDATE transcript_settings SET {} = NULL WHERE id = '1'",
+                    api_key_column
+                );
+                sqlx::query(&clear_query).execute(pool).await?;
+            }
+        }
         Ok(api_key)
     }
 
@@ -238,6 +369,8 @@ impl SettingsRepository {
     ) -> std::result::Result<(), sqlx::Error> {
         // Custom OpenAI uses JSON config - clear the entire config
         if provider == "custom-openai" {
+            #[cfg(target_os = "macos")]
+            delete_keychain_secret("summary", provider);
             sqlx::query("UPDATE settings SET customOpenAIConfig = NULL WHERE id = '1'")
                 .execute(pool)
                 .await?;
@@ -257,6 +390,9 @@ impl SettingsRepository {
                 ))
             }
         };
+
+        #[cfg(target_os = "macos")]
+        delete_keychain_secret("summary", provider);
 
         let query = format!(
             "UPDATE settings SET {} = NULL WHERE id = '1'",
@@ -297,11 +433,34 @@ impl SettingsRepository {
 
                 if let Some(json) = config_json {
                     // Parse JSON into CustomOpenAIConfig
-                    let config: CustomOpenAIConfig = serde_json::from_str(&json).map_err(|e| {
-                        sqlx::Error::Protocol(
-                            format!("Invalid JSON in customOpenAIConfig: {}", e).into(),
-                        )
-                    })?;
+                    let mut config: CustomOpenAIConfig =
+                        serde_json::from_str(&json).map_err(|e| {
+                            sqlx::Error::Protocol(
+                                format!("Invalid JSON in customOpenAIConfig: {}", e).into(),
+                            )
+                        })?;
+
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Some(secret) = read_keychain_secret("summary", "custom-openai") {
+                            config.api_key = Some(secret);
+                        } else if let Some(legacy_secret) = config.api_key.clone() {
+                            if !legacy_secret.trim().is_empty() {
+                                save_keychain_secret("summary", "custom-openai", &legacy_secret)?;
+                                let mut redacted = config.clone();
+                                redacted.api_key = None;
+                                let redacted_json = serde_json::to_string(&redacted).map_err(|error| {
+                                    sqlx::Error::Protocol(format!("Failed to redact legacy custom credential: {error}").into())
+                                })?;
+                                sqlx::query(
+                                    "UPDATE settings SET customOpenAIConfig = ? WHERE id = '1'",
+                                )
+                                .bind(redacted_json)
+                                .execute(pool)
+                                .await?;
+                            }
+                        }
+                    }
 
                     Ok(Some(config))
                 } else {
@@ -325,8 +484,20 @@ impl SettingsRepository {
         pool: &SqlitePool,
         config: &CustomOpenAIConfig,
     ) -> std::result::Result<(), sqlx::Error> {
-        // Serialize config to JSON
-        let config_json = serde_json::to_string(config).map_err(|e| {
+        let mut database_config = config.clone();
+        #[cfg(target_os = "macos")]
+        {
+            match config.api_key.as_deref() {
+                Some(secret) if !secret.trim().is_empty() => {
+                    save_keychain_secret("summary", "custom-openai", secret)?;
+                }
+                _ => delete_keychain_secret("summary", "custom-openai"),
+            }
+            database_config.api_key = None;
+        }
+
+        // Only non-secret endpoint/model parameters are serialized on macOS.
+        let config_json = serde_json::to_string(&database_config).map_err(|e| {
             sqlx::Error::Protocol(format!("Failed to serialize config to JSON: {}", e).into())
         })?;
 

@@ -1,10 +1,10 @@
 'use client';
 
 import React, { useEffect, useRef } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { emit, listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import { confirm } from '@tauri-apps/plugin-dialog';
 import { appDataDir } from '@tauri-apps/api/path';
+import { LogicalPosition, primaryMonitor, Window } from '@tauri-apps/api/window';
 import { toast } from 'sonner';
 import { useRouter } from 'next/navigation';
 import { recordingService } from '@/services/recordingService';
@@ -26,7 +26,7 @@ const DETECTION_DEDUPE_MS = 5_000;
  * recording orchestration. The detector owns the Snack Record state machine and
  * emits high-level Tauri events; this provider listens, shows NATIVE confirmation
  * dialogs (visible above a fullscreen meeting, unlike an in-app web modal), and
- * drives meetily's existing start/stop/save path — so no new DB-row or recording
+ * drives Snack Meet's existing start/stop/save path — so no new DB-row or recording
  * logic is created here.
  *
  *   meeting-detected { app_name, bundle_id, window_title }
@@ -43,7 +43,7 @@ const DETECTION_DEDUPE_MS = 5_000;
  * emits `recording-stopped` → useRecordingStop sets the sessionStorage
  * folder/meeting name), then call `window.handleRecordingStop(true)` (exposed
  * globally by useRecordingStop via RecordingPostProcessingProvider) to run the
- * full save → navigate → analytics flow.
+ * full save → navigate flow.
  */
 interface MeetingDetectedPayload {
   bundle_id: string;
@@ -55,6 +55,72 @@ interface MeetingDetectedPayload {
 interface MeetingEndedPayload {
   reason: string; // "app-exit" | "window-gone"
   bundle_id: string | null;
+}
+
+interface RecordingPromptResponse {
+  request_id: string;
+  accepted: boolean;
+}
+
+async function requestRecordingConfirmation(
+  appName: string,
+  bundleId: string,
+  windowTitle: string,
+  trigger: MeetingDetectedPayload['trigger']
+): Promise<boolean> {
+  const promptWindow = await Window.getByLabel('recording-prompt');
+  if (!promptWindow) throw new Error('录音确认窗口不可用');
+
+  const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  let resolveResponse!: (accepted: boolean) => void;
+  const responsePromise = new Promise<boolean>((resolve) => {
+    resolveResponse = resolve;
+  });
+  const unlisten = await listen<RecordingPromptResponse>('recording-prompt-response', (event) => {
+    if (event.payload.request_id === requestId) {
+      resolveResponse(event.payload.accepted);
+    }
+  });
+
+  let rebroadcastTimer: ReturnType<typeof setInterval> | null = null;
+  try {
+    const monitor = await primaryMonitor();
+    if (monitor) {
+      const scale = monitor.scaleFactor;
+      const width = 440;
+      const height = 250;
+      const x = monitor.position.x / scale + (monitor.size.width / scale - width) / 2;
+      const y = monitor.position.y / scale + (monitor.size.height / scale - height) / 2;
+      await promptWindow.setPosition(new LogicalPosition(x, y));
+    }
+
+    await promptWindow.setAlwaysOnTop(true);
+    await promptWindow.setVisibleOnAllWorkspaces(true);
+    await promptWindow.show();
+    await invoke('recording_prompt_ensure_frontmost');
+    await promptWindow.setFocus();
+
+    const payload = {
+      request_id: requestId,
+      app_name: appName,
+      bundle_id: bundleId,
+      window_title: windowTitle,
+      trigger,
+    };
+    // Hidden webviews are normally already mounted. Re-broadcasting also makes
+    // startup detection reliable if the prompt page finishes loading late.
+    await emit('recording-prompt-request', payload);
+    rebroadcastTimer = setInterval(() => {
+      emit('recording-prompt-request', payload).catch(() => undefined);
+      invoke('recording_prompt_ensure_frontmost').catch(() => undefined);
+    }, 1000);
+
+    return await responsePromise;
+  } finally {
+    if (rebroadcastTimer) clearInterval(rebroadcastTimer);
+    unlisten();
+    await promptWindow.hide().catch(() => undefined);
+  }
 }
 
 interface TranscriptionReadiness {
@@ -82,7 +148,7 @@ async function isCurrentlyRecording(): Promise<boolean> {
 }
 
 /** Stop the recording and trigger the existing post-processing/save flow. */
-async function stopAndSave(bundleId: string | null): Promise<void> {
+async function stopAndSave(): Promise<void> {
   if (!(await isCurrentlyRecording())) {
     // Nothing to stop (user stopped manually). Just clear detector recording state.
     await invoke('meeting_detector_set_recording_active', { active: false, bundleId: null })
@@ -154,15 +220,15 @@ export function MeetingDetectorProvider({ children }: { children: React.ReactNod
             return;
           }
 
-          // Always prompt the user before recording (a fast confirm dialog), so
-          // they stay in control. This applies to both window- and mic-triggered
-          // meetings (腾讯会议 etc.) — the dialog appears immediately on detection.
-          const ok = await confirm(`已检测到 ${app_name} 开启，是否自动录音？`, {
-            title: 'Snack Meet',
-            kind: 'warning',
-            okLabel: '开始录音',
-            cancelLabel: '取消',
-          });
+          // Use Snack Meet's dedicated centered top-level window instead of a
+          // native dialog. Native dialogs can leave a hidden tray app merely
+          // bouncing in the Dock without presenting anything visible.
+          const ok = await requestRecordingConfirmation(
+            app_name,
+            bundle_id,
+            window_title,
+            trigger
+          );
           if (!ok) return;
           if (await isCurrentlyRecording()) return; // user started manually meanwhile
           // Only the explicitly confirmed meeting-window path may enter the
@@ -200,12 +266,12 @@ export function MeetingDetectorProvider({ children }: { children: React.ReactNod
 
       const endedListener = await listen<MeetingEndedPayload>('meeting-ended', async (event) => {
         if (disposed) return;
-        const { reason, bundle_id } = event.payload;
+        const { reason } = event.payload;
         if (!(await isCurrentlyRecording())) return;
-        if (reason === 'app-exit' || reason === 'window-gone') {
+        if (reason === 'app-exit' || reason === 'window-gone' || reason === 'microphone-released') {
           // App fully exited or the meeting window stayed gone long enough to
           // confirm an end → stop and save without an extra confirmation.
-          await stopAndSave(bundle_id);
+          await stopAndSave();
           return;
         }
       });
@@ -233,7 +299,7 @@ export function MeetingDetectorProvider({ children }: { children: React.ReactNod
       unlistenDetected?.();
       unlistenEnded?.();
     };
-  }, [setMeetingTitle]);
+  }, [router, setMeetingTitle]);
 
   return <>{children}</>;
 }

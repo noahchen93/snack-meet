@@ -359,7 +359,7 @@ impl<R: Runtime> NotificationManager<R> {
         *self.initialized.read().await
     }
 
-    /// Get notification statistics (for analytics/debugging)
+    /// Get notification statistics
     pub async fn get_stats(&self) -> NotificationStats {
         let settings = self.settings.read().await;
 

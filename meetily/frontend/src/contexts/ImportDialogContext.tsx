@@ -28,7 +28,7 @@ export function ImportDialogProvider({ children, onOpen }: ImportDialogProviderP
     // Gate: Check beta feature flag before opening dialog
     if (!betaFeatures.importAndRetranscribe) {
       toast.error('Beta feature disabled', {
-        description: 'Enable "Import Audio & Retranscribe" in Settings > Beta to use this feature.'
+        description: 'Enable "Import Audio" in Settings > Beta to use this feature.'
       });
       return;
     }
