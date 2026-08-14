@@ -41,9 +41,13 @@ const MICROPHONE_END_STABLE_POLLS: u8 = 8; // ~6.4s; protects muted meetings wit
 const GENERIC_MICROPHONE_END_STABLE_POLLS: u8 = 5; // ~4s for sessions with no meeting window
 const MEETING_WINDOW_END_STABLE_POLLS: u8 = 4; // ~3.2s; a missing meeting window is high confidence
 const CANDIDATE_STABLE_POLLS: u8 = 1;
-const MICROPHONE_TRIGGER_POLLS: u8 = 1;
+// A known meeting app may confirm quickly, but a generic microphone client
+// needs to stay active long enough to rule out permission checks, camera setup,
+// push-to-talk, and other short-lived input sessions.
+const MEETING_APP_MICROPHONE_POLLS: u8 = 2;
+const GENERIC_MICROPHONE_POLLS: u8 = 8;
 const AUDIO_TRIGGER_MS: u64 = 1_000;
-const SILENT_FALLBACK_POLLS: u8 = 4;
+const SILENT_FALLBACK_POLLS: u8 = 8;
 // Voice input methods are not meetings. Typeless and WeChat Input Method must
 // never become microphone-triggered recording candidates. The WeChat bundle
 // spelling differs by distribution/version, so use the stable Tencent input
@@ -55,7 +59,15 @@ const MICROPHONE_WHITELIST_PREFIXES: &[&str] = &[
     "com.tencent.WXInputMethod",
     "com.tencent.weixin.inputmethod",
 ];
-const MICROPHONE_INFRASTRUCTURE_BUNDLES: &[&str] = &["com.apple.CoreSpeech"];
+const MICROPHONE_INFRASTRUCTURE_PREFIXES: &[&str] = &[
+    "com.apple.CoreSpeech",
+    "com.apple.SpeechRecognitionCore",
+    "com.apple.speechrecognitiond",
+    "com.apple.assistant",
+    "com.apple.avconferenced",
+    "com.apple.audio.AudioComponentRegistrar",
+];
+const SELF_BUNDLE_ROOTS: &[&str] = &["com.meetily.ai"];
 // Voice-messaging apps use the microphone both for live calls AND for short,
 // hold-to-talk voice messages. Requiring sustained mic use (~5 s) lets us detect
 // the former while ignoring the latter. Each poll is ~0.8 s apart.
@@ -86,6 +98,16 @@ const MONITORED: &[(&str, &str)] = &[
 /// call is confirmed only after the mic has been held for VOICE_CALL_MIN_POLLS, and
 /// the recording ends when the mic is released.
 const VOICE_CALL_APPS: &[&str] = &["com.tencent.xinWeChat", "net.whatsapp.WhatsApp"];
+
+/// Browser processes use the microphone for many non-meeting features. A
+/// browser is treated as a meeting app only when a meeting-like window from the
+/// same browser is present at the same time.
+const BROWSER_APPS: &[&str] = &[
+    "com.apple.Safari",
+    "com.google.Chrome",
+    "com.microsoft.edgemac",
+    "org.mozilla.firefox",
+];
 
 /// Dedicated meeting apps whose in-meeting window is identified by size, ignoring isOnScreen
 /// (main.m:2044).
@@ -177,7 +199,7 @@ struct MicrophoneActivityWatcher {
     receiver: tokio::sync::mpsc::Receiver<ca::Obj>,
     sender_ptr: usize,
     process_objects: Vec<ca::Obj>,
-    process_states: HashMap<u32, (Option<String>, bool)>,
+    process_states: HashMap<u32, (Option<String>, Option<u32>, bool)>,
 }
 
 impl MicrophoneActivityWatcher {
@@ -239,16 +261,20 @@ impl MicrophoneActivityWatcher {
     fn update_process_state(&mut self, object: ca::Obj) {
         let process = ca::Process(object);
         let bundle = process.bundle_id().ok().map(|id| id.to_string());
+        let pid = process.pid().ok().map(|pid| pid as u32);
         let active = process.is_running_input().unwrap_or(false);
-        self.process_states.insert(object.0, (bundle, active));
+        self.process_states.insert(object.0, (bundle, pid, active));
     }
 
     fn active_non_whitelisted_bundles(&self) -> Vec<String> {
         let mut active = filter_active_input_bundles(
             self.process_states
                 .values()
-                .filter(|(_, is_active)| *is_active)
-                .filter_map(|(bundle, _)| bundle.clone())
+                .filter(|(_, _, is_active)| *is_active)
+                .filter(|(bundle, pid, _)| {
+                    !is_self_audio_identity(bundle.as_deref(), *pid, std::process::id())
+                })
+                .filter_map(|(bundle, _, _)| bundle.clone())
                 .collect(),
         );
         active.sort_unstable();
@@ -343,6 +369,47 @@ fn is_dedicated(bundle: &str) -> bool {
     DEDICATED.contains(&bundle)
 }
 
+fn is_browser(bundle: &str) -> bool {
+    BROWSER_APPS.contains(&bundle)
+}
+
+fn is_monitored(bundle: &str) -> bool {
+    MONITORED.iter().any(|(id, _)| *id == bundle)
+}
+
+fn is_self_bundle(bundle: &str) -> bool {
+    SELF_BUNDLE_ROOTS.iter().any(|root| {
+        bundle == *root
+            || bundle
+                .strip_prefix(root)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+    })
+}
+
+fn is_self_audio_identity(bundle: Option<&str>, pid: Option<u32>, current_pid: u32) -> bool {
+    pid == Some(current_pid) || bundle.is_some_and(is_self_bundle)
+}
+
+fn is_product_window_title(title: &str) -> bool {
+    let title = title.trim().to_lowercase();
+    title == "snack meet"
+        || title.starts_with("snack meet ")
+        || title.starts_with("snack meet-")
+        || title == "meetily"
+        || title.starts_with("meetily ")
+        || title.starts_with("meetily-")
+}
+
+fn microphone_confirmation_polls(bundle: &str, has_meeting_window: bool) -> u8 {
+    if VOICE_CALL_APPS.contains(&bundle) {
+        VOICE_CALL_MIN_POLLS
+    } else if is_monitored(bundle) && (!is_browser(bundle) || has_meeting_window) {
+        MEETING_APP_MICROPHONE_POLLS
+    } else {
+        GENERIC_MICROPHONE_POLLS
+    }
+}
+
 fn app_name_for(bundle: &str) -> &'static str {
     MONITORED
         .iter()
@@ -404,6 +471,12 @@ fn is_home_title(title_lower: &str, bundle: &str) -> bool {
 
 /// Port of `windowSuggestsMeeting:bundleIdentifier:` (main.m:2286).
 fn window_suggests_meeting(bundle: &str, title: &str, width: f64, height: f64) -> bool {
+    // Defense in depth: Snack Meet's main, overlay, and prompt windows must
+    // never be considered meeting evidence, even if ScreenCaptureKit reports an
+    // unexpected owner or the broad English `meet` keyword matches the title.
+    if is_self_bundle(bundle) || is_product_window_title(title) {
+        return false;
+    }
     let title_lower = title.to_lowercase();
     if is_home_title(&title_lower, bundle) {
         return false;
@@ -488,11 +561,13 @@ fn filter_active_input_bundles(active: Vec<String>) -> Vec<String> {
     active
         .into_iter()
         .filter(|bundle| {
-            bundle != "com.meetily.ai"
+            !is_self_bundle(bundle)
                 && !MICROPHONE_WHITELIST_PREFIXES
                     .iter()
                     .any(|prefix| bundle.starts_with(prefix))
-                && !MICROPHONE_INFRASTRUCTURE_BUNDLES.contains(&bundle.as_str())
+                && !MICROPHONE_INFRASTRUCTURE_PREFIXES
+                    .iter()
+                    .any(|prefix| bundle.starts_with(prefix))
         })
         .collect()
 }
@@ -505,7 +580,15 @@ fn active_non_whitelisted_input_bundles() -> Vec<String> {
         .unwrap_or_default()
         .into_iter()
         .filter(|process| process.is_running_input().unwrap_or(false))
-        .filter_map(|process| process.bundle_id().ok().map(|id| id.to_string()))
+        .filter_map(|process| {
+            let bundle = process.bundle_id().ok().map(|id| id.to_string());
+            let pid = process.pid().ok().map(|pid| pid as u32);
+            if is_self_audio_identity(bundle.as_deref(), pid, std::process::id()) {
+                None
+            } else {
+                bundle
+            }
+        })
         .collect();
     filter_active_input_bundles(active)
 }
@@ -683,7 +766,18 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>, observed_input_bundles: Optio
             && window_suggests_meeting(&w.bundle, &w.title, w.width, w.height)
     });
     let candidate = if let Some(bundle) = microphone_bundle {
-        let scoped_window = meeting_window.filter(|window| window.bundle == bundle);
+        // Do not reuse the first meeting-like window globally: when two meeting
+        // apps are open, the window evidence must belong to the process that is
+        // actually using the microphone.
+        let scoped_window = windows.iter().find(|window| {
+            window.bundle == bundle
+                && window_suggests_meeting(
+                    &window.bundle,
+                    &window.title,
+                    window.width,
+                    window.height,
+                )
+        });
         DetectionCandidate {
             signature: format!("microphone:{bundle}"),
             title: scoped_window
@@ -693,7 +787,10 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>, observed_input_bundles: Optio
             bundle,
             microphone_trigger: true,
         }
-    } else if let Some(window) = meeting_window {
+    } else if let Some(window) = meeting_window.filter(|window| !is_browser(&window.bundle)) {
+        // Browser titles are not trustworthy enough on their own: articles,
+        // recordings, and ordinary pages often contain “meet” or “call”. A
+        // browser candidate is therefore created only through microphone use.
         DetectionCandidate {
             signature: window.signature(),
             bundle: window.bundle.clone(),
@@ -763,27 +860,18 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>, observed_input_bundles: Optio
             .as_deref()
             .map_or(true, |previous| previous == signature);
     let audio_confirmed = active_audio_ms >= AUDIO_TRIGGER_MS;
-    // Voice-calling apps (WeChat / WhatsApp) use the mic for brief hold-to-talk
-    // voice messages too, so require sustained mic use for them. Regular meeting
-    // apps confirm after just MICROPHONE_TRIGGER_POLLS.
-    let mic_threshold = if VOICE_CALL_APPS.contains(&candidate.bundle.as_str()) {
-        VOICE_CALL_MIN_POLLS
-    } else {
-        MICROPHONE_TRIGGER_POLLS
-    };
+    let mic_threshold =
+        microphone_confirmation_polls(&candidate.bundle, candidate.window_id.is_some());
     let microphone_confirmed = det.microphone_active_polls >= mic_threshold;
-    let silent_fallback = det.candidate_stable_polls >= SILENT_FALLBACK_POLLS;
-
-    // Any monitored meeting app is a strong signal on its own — a meeting window
-    // appearing (or the app grabbing the mic) is enough to prompt the user
-    // immediately, even if the mic is silent. Only WeChat/WhatsApp voice-message
-    // apps keep a sustained-use gate. This makes detection nearly instant.
-    let is_fast_trigger = !VOICE_CALL_APPS.contains(&candidate.bundle.as_str())
-        && det.candidate_stable_polls >= CANDIDATE_STABLE_POLLS;
+    // Only dedicated clients have a reliable enough in-meeting window for a
+    // silent fallback. Other apps need microphone or captured-audio evidence.
+    let silent_fallback = !candidate.microphone_trigger
+        && is_dedicated(&candidate.bundle)
+        && det.candidate_stable_polls >= SILENT_FALLBACK_POLLS;
 
     if cooldown_blocks_candidate
         || det.candidate_stable_polls < CANDIDATE_STABLE_POLLS
-        || (!is_fast_trigger && !microphone_confirmed && !audio_confirmed && !silent_fallback)
+        || (!microphone_confirmed && !audio_confirmed && !silent_fallback)
     {
         return;
     }
@@ -1079,6 +1167,22 @@ mod tests {
     }
 
     #[test]
+    fn snack_meet_can_never_be_window_evidence() {
+        assert!(!window_suggests_meeting(
+            "com.meetily.ai",
+            "Snack Meet",
+            1280.0,
+            720.0
+        ));
+        assert!(!window_suggests_meeting(
+            "com.google.Chrome",
+            "Snack Meet Recording",
+            1280.0,
+            720.0
+        ));
+    }
+
+    #[test]
     fn keyword_match_in_browser() {
         assert!(window_suggests_meeting(
             "com.google.Chrome",
@@ -1117,7 +1221,11 @@ mod tests {
             "now.typeless.desktop".into(),
             "now.typeless.desktop.helper".into(),
             "com.apple.CoreSpeech".into(),
+            "com.apple.SpeechRecognitionCore.speechrecognitiond".into(),
+            "com.apple.avconferenced".into(),
             "com.meetily.ai".into(),
+            "com.meetily.ai.helper".into(),
+            "com.meetily.ai.webview.audio".into(),
             "com.tencent.meeting".into(),
             "com.example.voice-input".into(),
         ]);
@@ -1125,6 +1233,55 @@ mod tests {
             filtered,
             vec!["com.tencent.meeting", "com.example.voice-input"]
         );
+    }
+
+    #[test]
+    fn current_pid_and_self_bundle_tree_are_always_excluded() {
+        assert!(is_self_audio_identity(
+            Some("com.example.unknown-helper"),
+            Some(42),
+            42
+        ));
+        assert!(is_self_audio_identity(
+            Some("com.meetily.ai.audio-helper"),
+            Some(99),
+            42
+        ));
+        assert!(!is_self_audio_identity(
+            Some("com.tencent.meeting"),
+            Some(99),
+            42
+        ));
+    }
+
+    #[test]
+    fn microphone_confirmation_uses_evidence_tiers() {
+        assert_eq!(
+            microphone_confirmation_polls("com.tencent.meeting", false),
+            MEETING_APP_MICROPHONE_POLLS
+        );
+        assert_eq!(
+            microphone_confirmation_polls("com.google.Chrome", true),
+            MEETING_APP_MICROPHONE_POLLS
+        );
+        assert_eq!(
+            microphone_confirmation_polls("com.google.Chrome", false),
+            GENERIC_MICROPHONE_POLLS
+        );
+        assert_eq!(
+            microphone_confirmation_polls("com.example.camera-test", false),
+            GENERIC_MICROPHONE_POLLS
+        );
+        assert_eq!(
+            microphone_confirmation_polls("com.tencent.xinWeChat", false),
+            VOICE_CALL_MIN_POLLS
+        );
+    }
+
+    #[test]
+    fn browser_windows_are_never_standalone_candidates() {
+        assert!(is_browser("com.google.Chrome"));
+        assert!(!is_browser("com.tencent.meeting"));
     }
 
     #[test]
