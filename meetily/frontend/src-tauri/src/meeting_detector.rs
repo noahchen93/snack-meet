@@ -15,11 +15,11 @@
 //!   * Confirmation dialogs are shown by the frontend for starts. When an active
 //!     meeting window remains absent for several polls, recording stops automatically.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cidre::{core_audio as ca, ns, sc};
+use cidre::{core_audio as ca, ns, os, sc};
 use serde::Serialize;
 use tauri::{async_runtime::Mutex, AppHandle, Emitter, Manager, Runtime, State};
 use tokio::time::sleep;
@@ -28,7 +28,13 @@ use tracing::{info, warn};
 
 use crate::meeting_audio_probe::{self, AudioProbeHandle};
 
-const POLL_INTERVAL: Duration = Duration::from_millis(800);
+// Detector polling must never keep a microphone input stream open. Idle
+// detection only queries process/window metadata; once a candidate or active
+// recording exists we temporarily use the faster cadence needed for prompt/stop
+// responsiveness.
+const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(800);
+const EVENT_DRIVEN_IDLE_INTERVAL: Duration = Duration::from_secs(30);
+const POLLING_FALLBACK_INTERVAL: Duration = Duration::from_millis(2_500);
 const START_COOLDOWN: Duration = Duration::from_secs(600); // 10 min after a declined start prompt
 const STOP_COOLDOWN: Duration = Duration::from_secs(10); // short gap after a recording ends
 const MICROPHONE_END_STABLE_POLLS: u8 = 8; // ~6.4s; protects muted meetings without window access
@@ -136,6 +142,165 @@ pub struct MeetingDetector {
     cooldown_signature: Option<String>,
     audio_probe: Option<AudioProbeHandle>,
     cancel: Option<CancellationToken>,
+}
+
+impl MeetingDetector {
+    fn next_poll_interval(&self, now: Instant, microphone_watcher_available: bool) -> Duration {
+        let cooldown_active = self.cooldown_until.is_some_and(|until| now < until);
+        if self.recording_active || (self.candidate_signature.is_some() && !cooldown_active) {
+            ACTIVE_POLL_INTERVAL
+        } else if microphone_watcher_available {
+            EVENT_DRIVEN_IDLE_INTERVAL
+        } else {
+            POLLING_FALLBACK_INTERVAL
+        }
+    }
+}
+
+extern "C-unwind" fn microphone_activity_listener(
+    _obj_id: ca::Obj,
+    _number_addresses: u32,
+    _addresses: *const ca::PropAddr,
+    client_data: *mut (),
+) -> os::Status {
+    // SAFETY: `client_data` points to the boxed sender owned by
+    // `MicrophoneActivityWatcher`; listeners are removed before the box is
+    // reclaimed in Drop.
+    let sender = unsafe { &*(client_data as *const tokio::sync::mpsc::Sender<ca::Obj>) };
+    // Coalesce bursts (for example, an app creating several input streams) into
+    // one detector pass. The callback must never block CoreAudio's IO thread.
+    let _ = sender.try_send(_obj_id);
+    os::Status::NO_ERR
+}
+
+struct MicrophoneActivityWatcher {
+    receiver: tokio::sync::mpsc::Receiver<ca::Obj>,
+    sender_ptr: usize,
+    process_objects: Vec<ca::Obj>,
+    process_states: HashMap<u32, (Option<String>, bool)>,
+}
+
+impl MicrophoneActivityWatcher {
+    fn new() -> Result<Self, String> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
+        let sender_ptr = Box::into_raw(Box::new(sender)) as usize;
+        let client_data = sender_ptr as *mut ();
+        let process_list_addr = ca::PropSelector::HW_PROCESS_OBJ_LIST.global_addr();
+
+        if let Err(error) = ca::System::OBJ.add_prop_listener(
+            &process_list_addr,
+            microphone_activity_listener,
+            client_data,
+        ) {
+            // SAFETY: registration failed, so CoreAudio cannot retain this pointer.
+            unsafe {
+                drop(Box::from_raw(
+                    sender_ptr as *mut tokio::sync::mpsc::Sender<ca::Obj>,
+                ))
+            };
+            return Err(format!("could not watch CoreAudio process list: {error}"));
+        }
+
+        let mut watcher = Self {
+            receiver,
+            sender_ptr,
+            process_objects: Vec::new(),
+            process_states: HashMap::new(),
+        };
+        watcher.refresh_process_list();
+        Ok(watcher)
+    }
+
+    fn refresh_process_list(&mut self) {
+        let input_addr = ca::PropSelector::PROCESS_IS_RUNNING_INPUT.global_addr();
+        let client_data = self.sender_ptr as *mut ();
+
+        for object in self.process_objects.drain(..) {
+            let _ = ca::Process(object).remove_prop_listener(
+                &input_addr,
+                microphone_activity_listener,
+                client_data,
+            );
+        }
+        self.process_states.clear();
+
+        for process in ca::Process::list().unwrap_or_default() {
+            let object = process.0;
+            if process
+                .add_prop_listener(&input_addr, microphone_activity_listener, client_data)
+                .is_ok()
+            {
+                self.process_objects.push(object);
+                self.update_process_state(object);
+            }
+        }
+    }
+
+    fn update_process_state(&mut self, object: ca::Obj) {
+        let process = ca::Process(object);
+        let bundle = process.bundle_id().ok().map(|id| id.to_string());
+        let active = process.is_running_input().unwrap_or(false);
+        self.process_states.insert(object.0, (bundle, active));
+    }
+
+    fn active_non_whitelisted_bundles(&self) -> Vec<String> {
+        let mut active = filter_active_input_bundles(
+            self.process_states
+                .values()
+                .filter(|(_, is_active)| *is_active)
+                .filter_map(|(bundle, _)| bundle.clone())
+                .collect(),
+        );
+        active.sort_unstable();
+        active
+    }
+
+    async fn changed(&mut self) {
+        let Some(first_object) = self.receiver.recv().await else {
+            return;
+        };
+        let mut changed_objects = HashSet::from([first_object.0]);
+        while let Ok(object) = self.receiver.try_recv() {
+            changed_objects.insert(object.0);
+        }
+
+        // A process-list notification may introduce a new CoreAudio process.
+        // Rebuild listeners and the state cache in that case. Ordinary input
+        // transitions update only the process that changed, avoiding an
+        // expensive query across every CoreAudio client.
+        if changed_objects.contains(&ca::System::OBJ.0) {
+            self.refresh_process_list();
+            return;
+        }
+        for object_id in changed_objects {
+            self.update_process_state(ca::Obj(object_id));
+        }
+    }
+}
+
+impl Drop for MicrophoneActivityWatcher {
+    fn drop(&mut self) {
+        let input_addr = ca::PropSelector::PROCESS_IS_RUNNING_INPUT.global_addr();
+        let client_data = self.sender_ptr as *mut ();
+        for object in self.process_objects.drain(..) {
+            let _ = ca::Process(object).remove_prop_listener(
+                &input_addr,
+                microphone_activity_listener,
+                client_data,
+            );
+        }
+        let _ = ca::System::OBJ.remove_prop_listener(
+            &ca::PropSelector::HW_PROCESS_OBJ_LIST.global_addr(),
+            microphone_activity_listener,
+            client_data,
+        );
+        // SAFETY: every listener using this pointer has been removed above.
+        unsafe {
+            drop(Box::from_raw(
+                self.sender_ptr as *mut tokio::sync::mpsc::Sender<ca::Obj>,
+            ));
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -377,7 +542,7 @@ async fn emit_meeting_ended<R: Runtime>(
 // Poll loop + state machine
 // ---------------------------------------------------------------------------
 
-async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
+async fn poll_once<R: Runtime>(app: &AppHandle<R>, observed_input_bundles: Option<&[String]>) {
     let state = app.state::<DetectorState>();
     // Snapshot the fields we need, then release the lock before any .await.
     let (enabled, ui_ready, recording_active, recorded_bundle, cooldown) = {
@@ -411,7 +576,10 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
         // when the mic is released. WeChat/WhatsApp run continuously, so "running"
         // alone cannot signal the end — we must watch mic use instead.
         let is_voice_call = VOICE_CALL_APPS.contains(&rb.as_str());
-        let microphone_active = active_non_whitelisted_input_bundles().contains(rb);
+        let microphone_active = observed_input_bundles.map_or_else(
+            || active_non_whitelisted_input_bundles().contains(rb),
+            |bundles| bundles.iter().any(|bundle| bundle == rb),
+        );
 
         if monitored_recording && !running.contains(rb) {
             emit_meeting_ended(app, state.inner(), rb, "app-exit").await;
@@ -486,7 +654,9 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
     // Microphone use is the primary global signal. Prefer a monitored meeting
     // app when several processes are using input; otherwise use the first
     // non-whitelisted input process (Typeless is excluded above).
-    let active_input_bundles = active_non_whitelisted_input_bundles();
+    let active_input_bundles = observed_input_bundles
+        .map(|bundles| bundles.to_vec())
+        .unwrap_or_else(active_non_whitelisted_input_bundles);
     let microphone_bundle = active_input_bundles
         .iter()
         .find(|bundle| running.contains(bundle.as_str()))
@@ -650,15 +820,47 @@ async fn poll_once<R: Runtime>(app: &AppHandle<R>) {
 }
 
 async fn poll_loop<R: Runtime>(app: AppHandle<R>, cancel: CancellationToken) {
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = sleep(POLL_INTERVAL) => {}
+    let mut microphone_watcher = match MicrophoneActivityWatcher::new() {
+        Ok(watcher) => {
+            info!("meeting detector using event-driven microphone activity watcher");
+            Some(watcher)
         }
+        Err(error) => {
+            warn!("microphone activity watcher unavailable; using polling fallback: {error}");
+            None
+        }
+    };
+
+    loop {
+        let interval = {
+            let state = app.state::<DetectorState>();
+            let detector = state.lock().await;
+            detector.next_poll_interval(Instant::now(), microphone_watcher.is_some())
+        };
+        let microphone_changed = async {
+            if let Some(watcher) = microphone_watcher.as_mut() {
+                watcher.changed().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let fallback_refresh = tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = sleep(interval) => true,
+            _ = microphone_changed => false,
+        };
         if cancel.is_cancelled() {
             break;
         }
-        poll_once(&app).await;
+        if fallback_refresh && interval == EVENT_DRIVEN_IDLE_INTERVAL {
+            if let Some(watcher) = microphone_watcher.as_mut() {
+                watcher.refresh_process_list();
+            }
+        }
+        let observed_input_bundles = microphone_watcher
+            .as_ref()
+            .map(MicrophoneActivityWatcher::active_non_whitelisted_bundles);
+        poll_once(&app, observed_input_bundles.as_deref()).await;
     }
     info!("meeting detector poll loop stopped");
 }
@@ -923,5 +1125,45 @@ mod tests {
             filtered,
             vec!["com.tencent.meeting", "com.example.voice-input"]
         );
+    }
+
+    #[test]
+    fn detector_uses_low_power_idle_polling() {
+        let detector = MeetingDetector::default();
+        assert_eq!(
+            detector.next_poll_interval(Instant::now(), true),
+            EVENT_DRIVEN_IDLE_INTERVAL
+        );
+        assert_eq!(
+            detector.next_poll_interval(Instant::now(), false),
+            POLLING_FALLBACK_INTERVAL
+        );
+    }
+
+    #[test]
+    fn detector_only_accelerates_for_candidate_or_active_recording() {
+        let now = Instant::now();
+        let mut detector = MeetingDetector {
+            candidate_signature: Some("microphone:com.tencent.meeting".into()),
+            ..MeetingDetector::default()
+        };
+        assert_eq!(detector.next_poll_interval(now, true), ACTIVE_POLL_INTERVAL);
+
+        detector.cooldown_until = Some(now + Duration::from_secs(60));
+        assert_eq!(
+            detector.next_poll_interval(now, true),
+            EVENT_DRIVEN_IDLE_INTERVAL
+        );
+
+        detector.recording_active = true;
+        assert_eq!(detector.next_poll_interval(now, true), ACTIVE_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn microphone_activity_watcher_registers_and_releases_listeners() {
+        let watcher = MicrophoneActivityWatcher::new()
+            .expect("CoreAudio microphone activity listeners should register");
+        assert!(!watcher.process_objects.is_empty());
+        drop(watcher);
     }
 }

@@ -24,7 +24,7 @@ export default function RecordingOverlayPage() {
   const wasRecording = useRef(false);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const sync = useCallback(async () => {
+  const sync = useCallback(async (): Promise<RecordingState | null> => {
     try {
       const next = await invoke<RecordingState>('get_recording_state');
       if (next.is_recording) {
@@ -38,16 +38,70 @@ export default function RecordingOverlayPage() {
         }, 4500);
       }
       setState(next);
+      return next;
     } catch (error) {
       console.warn('[Recording overlay] State sync failed:', error);
+      return null;
     }
   }, []);
 
   useEffect(() => {
-    sync();
-    const timer = setInterval(sync, 500);
+    let pollingTimer: ReturnType<typeof setInterval> | null = null;
+    let disposed = false;
+    const stopPolling = () => {
+      if (pollingTimer) {
+        clearInterval(pollingTimer);
+        pollingTimer = null;
+      }
+    };
+    const startPolling = () => {
+      if (!pollingTimer && !disposed) {
+        // Duration only changes once per second. Keep the hidden overlay fully
+        // idle until a recording-started event arrives.
+        pollingTimer = setInterval(() => {
+          sync().then((nextState) => {
+            // Also self-heal if a backend stop event is ever missed.
+            if (nextState && !nextState.is_recording) stopPolling();
+          });
+        }, 1000);
+      }
+    };
+
+    sync().then((initialState) => {
+      if (initialState?.is_recording) startPolling();
+    });
+
+    let unlistenStarted: (() => void) | undefined;
+    let unlistenPaused: (() => void) | undefined;
+    let unlistenResumed: (() => void) | undefined;
     let unlistenCaptureStopped: (() => void) | undefined;
+    listen('recording-started', () => {
+      sync().catch(() => undefined);
+      startPolling();
+    }).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenStarted = unlisten;
+    }).catch(error => {
+      console.warn('[Recording overlay] Could not listen for recording start:', error);
+    });
+    listen('recording-paused', () => {
+      sync().catch(() => undefined);
+    }).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenPaused = unlisten;
+    }).catch(error => {
+      console.warn('[Recording overlay] Could not listen for recording pause:', error);
+    });
+    listen('recording-resumed', () => {
+      sync().catch(() => undefined);
+    }).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenResumed = unlisten;
+    }).catch(error => {
+      console.warn('[Recording overlay] Could not listen for recording resume:', error);
+    });
     listen('recording-capture-stopped', () => {
+      stopPolling();
       wasRecording.current = false;
       setEnded(true);
       setState(previous => previous ? {
@@ -61,12 +115,17 @@ export default function RecordingOverlayPage() {
         getCurrentWindow().hide().catch(() => undefined);
       }, 1800);
     }).then(unlisten => {
-      unlistenCaptureStopped = unlisten;
+      if (disposed) unlisten();
+      else unlistenCaptureStopped = unlisten;
     }).catch(error => {
       console.warn('[Recording overlay] Could not listen for capture stop:', error);
     });
     return () => {
-      clearInterval(timer);
+      disposed = true;
+      stopPolling();
+      unlistenStarted?.();
+      unlistenPaused?.();
+      unlistenResumed?.();
       unlistenCaptureStopped?.();
       if (hideTimer.current) clearTimeout(hideTimer.current);
     };
