@@ -95,16 +95,6 @@ pub fn find_builtin_output_device() -> Result<Option<AudioDevice>> {
                         continue; // Skip Bluetooth devices
                     }
 
-                    // Additional filter: exclude virtual audio devices
-                    // (we want real hardware speakers for ScreenCaptureKit)
-                    if name_lower.contains("blackhole")
-                        || name_lower.contains("vb-audio")
-                        || name_lower.contains("virtual")
-                        || name_lower.contains("loopback")
-                    {
-                        continue; // Skip virtual devices
-                    }
-
                     info!("🔊 Found built-in speaker: '{}'", name);
                     return Ok(Some(AudioDevice::new(name, DeviceType::Output)));
                 }

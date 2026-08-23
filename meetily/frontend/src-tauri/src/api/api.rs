@@ -1,7 +1,9 @@
 use log::{debug as log_debug, error as log_error, info as log_info, warn as log_warn};
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use std::collections::HashMap;
-use tauri::{AppHandle, Runtime};
+use std::path::{Path, PathBuf};
+use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::{
@@ -32,6 +34,27 @@ pub struct Meeting {
     pub title: String,
     #[serde(rename = "createdAt")]
     pub created_at: Option<String>,
+    #[serde(rename = "audioExists")]
+    pub audio_exists: bool,
+    #[serde(rename = "audioSizeBytes")]
+    pub audio_size_bytes: u64,
+    #[serde(rename = "transcriptCharCount")]
+    pub transcript_char_count: usize,
+    #[serde(rename = "transcriptSegmentCount")]
+    pub transcript_segment_count: usize,
+    #[serde(rename = "durationSeconds")]
+    pub duration_seconds: f64,
+    pub keywords: Vec<String>,
+    pub is_imported: bool,
+    pub is_read: bool,
+    #[serde(rename = "hasSummary")]
+    pub has_summary: bool,
+    #[serde(rename = "collectionId")]
+    pub collection_id: Option<String>,
+    #[serde(rename = "isArchived")]
+    pub is_archived: bool,
+    #[serde(rename = "isFavorite")]
+    pub is_favorite: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,6 +69,10 @@ pub struct TranscriptSearchResult {
     #[serde(rename = "matchContext")]
     pub match_context: String,
     pub timestamp: String,
+    #[serde(rename = "matchTypes")]
+    pub match_types: Vec<String>,
+    #[serde(rename = "matchCount")]
+    pub match_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -153,6 +180,8 @@ pub struct MeetingMetadata {
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_path: Option<String>,
 }
 
 /// Paginated transcripts response with total count
@@ -344,12 +373,97 @@ pub async fn api_get_meetings<R: Runtime>(
         Ok(meeting_models) => {
             log_info!("Successfully got {} meetings", meeting_models.len());
 
+            // Calculate card metadata inside SQLite. Loading and concatenating
+            // every transcript made home-page refresh cost grow with the entire
+            // archive and duplicated all transcript text in memory.
+            let mut content_by_meeting: HashMap<String, (usize, usize, f64)> = HashMap::new();
+            if let Ok(rows) = sqlx::query(
+                "SELECT meeting_id, \
+                        COALESCE(SUM(LENGTH(TRIM(transcript))), 0) AS char_count, \
+                        COUNT(*) AS segment_count, \
+                        COALESCE(MAX(audio_end_time), 0) AS duration_seconds \
+                 FROM transcripts GROUP BY meeting_id",
+            )
+            .fetch_all(pool)
+            .await
+            {
+                for row in rows {
+                    let meeting_id: String = row.try_get("meeting_id").unwrap_or_default();
+                    let char_count: i64 = row.try_get("char_count").unwrap_or_default();
+                    let segment_count: i64 = row.try_get("segment_count").unwrap_or_default();
+                    let duration_seconds: f64 = row.try_get("duration_seconds").unwrap_or_default();
+                    content_by_meeting.insert(
+                        meeting_id,
+                        (
+                            char_count.max(0) as usize,
+                            segment_count.max(0) as usize,
+                            duration_seconds.max(0.0),
+                        ),
+                    );
+                }
+            }
+
+            // Keywords are authored by the summary model and saved inside the
+            // completed summary result. Meetings that have never been summarized
+            // intentionally have no tags.
+            let mut keywords_by_meeting: HashMap<String, Vec<String>> = HashMap::new();
+            let mut summarized_meetings: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            if let Ok(rows) = sqlx::query(
+                "SELECT meeting_id, result FROM summary_processes WHERE status = 'completed' AND result IS NOT NULL ORDER BY updated_at ASC",
+            )
+            .fetch_all(pool)
+            .await
+            {
+                for row in rows {
+                    let meeting_id: String = row.try_get("meeting_id").unwrap_or_default();
+                    summarized_meetings.insert(meeting_id.clone());
+                    let raw_result: String = row.try_get("result").unwrap_or_default();
+                    let keywords = serde_json::from_str::<serde_json::Value>(&raw_result)
+                        .ok()
+                        .and_then(|value| value.get("keywords").and_then(|items| items.as_array()).cloned())
+                        .map(|items| {
+                            items
+                                .into_iter()
+                                .filter_map(|item| item.as_str().map(str::trim).map(str::to_string))
+                                .filter(|item| !item.is_empty())
+                                .take(5)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if !keywords.is_empty() {
+                        keywords_by_meeting.insert(meeting_id, keywords);
+                    }
+                }
+            }
+
             let result: Vec<Meeting> = meeting_models
                 .into_iter()
-                .map(|m| Meeting {
-                    id: m.id,
-                    title: m.title,
-                    created_at: Some(m.created_at.0.to_rfc3339()),
+                .map(|m| {
+                    let (audio_exists, audio_size_bytes) =
+                        meeting_audio_status(m.folder_path.as_deref());
+                    let (char_count, segment_count, duration_seconds) = content_by_meeting
+                        .get(&m.id)
+                        .copied()
+                        .unwrap_or((0, 0, 0.0));
+                    let keywords = keywords_by_meeting.get(&m.id).cloned().unwrap_or_default();
+                    Meeting {
+                        id: m.id.clone(),
+                        title: m.title,
+                        created_at: Some(m.created_at.0.to_rfc3339()),
+                        audio_exists,
+                        audio_size_bytes,
+                        transcript_char_count: char_count,
+                        transcript_segment_count: segment_count,
+                        duration_seconds,
+                        keywords,
+                        is_imported: m.is_imported,
+                        is_read: m.is_read,
+                        has_summary: summarized_meetings.contains(&m.id),
+                        collection_id: m.collection_id,
+                        is_archived: m.is_archived,
+                        is_favorite: m.is_favorite,
+                    }
                 })
                 .collect();
             Ok(result)
@@ -359,6 +473,119 @@ pub async fn api_get_meetings<R: Runtime>(
             Err(e.to_string())
         }
     }
+}
+
+/// Returns audio presence and size for a meeting folder. The filesystem is the
+/// source of truth: users may remove audio outside Snack Meet or restore it via
+/// sync, without changing the database.
+fn meeting_audio_status(folder_path: Option<&str>) -> (bool, u64) {
+    let Some(folder) = folder_path.filter(|path| !path.trim().is_empty()) else {
+        return (false, 0);
+    };
+    let folder = std::path::Path::new(folder);
+    audio_paths_in_folder(folder)
+        .into_iter()
+        .filter_map(|path| std::fs::metadata(path).ok().map(|meta| meta.len()))
+        .fold((false, 0u64), |(_, total), size| {
+            (true, total.saturating_add(size))
+        })
+}
+
+/// Determine which regular files in a meeting folder are audio assets. Prefer
+/// metadata.json's explicit audio_file; older recordings fall back to supported
+/// audio extensions. Never return a symlink or a path outside the folder.
+fn audio_paths_in_folder(folder: &std::path::Path) -> Vec<std::path::PathBuf> {
+    if !folder.is_dir() || folder.is_symlink() {
+        return Vec::new();
+    }
+    let from_metadata = std::fs::read_to_string(folder.join("metadata.json"))
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .and_then(|json| json.get("audio_file")?.as_str().map(str::to_string))
+        .and_then(|name| {
+            let candidate = std::path::Path::new(&name);
+            // audio_file must be a plain filename; metadata cannot point outside
+            // the meeting folder.
+            (candidate.file_name() == Some(candidate.as_os_str()) && !name.is_empty())
+                .then(|| folder.join(candidate))
+        })
+        .filter(|path| path.is_file() && !path.is_symlink());
+    if let Some(path) = from_metadata {
+        return vec![path];
+    }
+
+    const AUDIO_EXTENSIONS: &[&str] = &[
+        "aac", "aiff", "flac", "m4a", "m4b", "mkv", "mp3", "mp4", "ogg", "opus", "wav", "webm",
+        "wma",
+    ];
+    std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && !path.is_symlink()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        AUDIO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+                    })
+        })
+        .collect()
+}
+
+/// Delete only audio assets for selected meetings. Meeting rows, transcripts,
+/// summaries and metadata remain intact so the record continues to appear.
+#[tauri::command]
+pub async fn api_delete_meeting_audio_files<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    meeting_ids: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    let pool = state.db_manager.pool();
+    let mut deleted = 0usize;
+    let mut missing = 0usize;
+    let mut failed = Vec::new();
+    let mut freed_bytes = 0u64;
+
+    for meeting_id in meeting_ids {
+        let folder_path: Option<String> =
+            sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+                .bind(&meeting_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| format!("Failed to query meeting folder_path: {}", e))?;
+        let paths = folder_path
+            .as_deref()
+            .map(std::path::Path::new)
+            .map(audio_paths_in_folder)
+            .unwrap_or_default();
+        if paths.is_empty() {
+            missing += 1;
+            continue;
+        }
+        let mut deleted_this_meeting = false;
+        for path in paths {
+            let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    deleted_this_meeting = true;
+                    freed_bytes = freed_bytes.saturating_add(size);
+                }
+                Err(error) => failed.push(format!("{}: {}", path.display(), error)),
+            }
+        }
+        if deleted_this_meeting {
+            deleted += 1;
+        }
+    }
+
+    if !failed.is_empty() {
+        return Err(format!("部分音频未能删除：{}", failed.join("；")));
+    }
+    Ok(serde_json::json!({ "deleted": deleted, "missing": missing, "freed_bytes": freed_bytes }))
 }
 
 #[tauri::command]
@@ -786,9 +1013,126 @@ pub async fn api_delete_meeting<R: Runtime>(
     }
 }
 
+#[derive(Debug)]
+struct QuarantinedMeetingFolder {
+    original: PathBuf,
+    quarantined: PathBuf,
+}
+
+fn is_safe_meeting_directory(root: &Path, candidate: &Path) -> bool {
+    candidate != root && candidate.starts_with(root)
+}
+
+async fn quarantine_meeting_folder<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: &str,
+    folder: &str,
+) -> Result<Option<QuarantinedMeetingFolder>, String> {
+    if folder.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let candidate = Path::new(folder);
+    if !candidate.exists() {
+        return Ok(None);
+    }
+    let metadata = std::fs::symlink_metadata(candidate)
+        .map_err(|error| format!("Failed to inspect meeting folder: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("Refusing to delete unsafe meeting path: {folder}"));
+    }
+
+    let preferences = crate::audio::recording_preferences::load_recording_preferences(app)
+        .await
+        .map_err(|error| format!("Failed to load recordings folder: {error}"))?;
+    let root = preferences
+        .save_folder
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve recordings folder: {error}"))?;
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve meeting folder: {error}"))?;
+
+    if !is_safe_meeting_directory(&root, &canonical) {
+        return Err(format!(
+            "Refusing to delete a path outside the configured recordings folder: {}",
+            canonical.display()
+        ));
+    }
+
+    let quarantine_root = root.join(".snack-meet-trash");
+    std::fs::create_dir_all(&quarantine_root)
+        .map_err(|error| format!("Failed to create meeting quarantine: {error}"))?;
+    let safe_id: String = meeting_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(80)
+        .collect();
+    let quarantined = quarantine_root.join(format!("{}-{}", safe_id, uuid::Uuid::new_v4()));
+    std::fs::rename(&canonical, &quarantined)
+        .map_err(|error| format!("Failed to quarantine meeting folder: {error}"))?;
+
+    Ok(Some(QuarantinedMeetingFolder {
+        original: canonical,
+        quarantined,
+    }))
+}
+
+fn restore_quarantined_folders(folders: &[QuarantinedMeetingFolder]) {
+    for folder in folders.iter().rev() {
+        if let Err(error) = std::fs::rename(&folder.quarantined, &folder.original) {
+            log_error!(
+                "Failed to restore quarantined meeting folder {}: {}",
+                folder.original.display(),
+                error
+            );
+        }
+    }
+}
+
+fn remove_quarantined_folders(folders: &[QuarantinedMeetingFolder]) -> usize {
+    folders
+        .iter()
+        .filter(
+            |folder| match std::fs::remove_dir_all(&folder.quarantined) {
+                Ok(()) => true,
+                Err(error) => {
+                    log_warn!(
+                        "Meeting database row was deleted, but quarantined files remain at {}: {}",
+                        folder.quarantined.display(),
+                        error
+                    );
+                    false
+                }
+            },
+        )
+        .count()
+}
+
+#[cfg(test)]
+mod deletion_safety_tests {
+    use super::is_safe_meeting_directory;
+    use std::path::Path;
+
+    #[test]
+    fn meeting_directory_must_be_below_recordings_root() {
+        let root = Path::new("/Users/example/Movies/Snack Meet Recordings");
+        assert!(is_safe_meeting_directory(root, &root.join("meeting-123")));
+        assert!(!is_safe_meeting_directory(root, root));
+        assert!(!is_safe_meeting_directory(
+            root,
+            Path::new("/Users/example")
+        ));
+        assert!(!is_safe_meeting_directory(
+            root,
+            Path::new("/Users/example/Movies/Snack Meet Recordings-copy/meeting-123")
+        ));
+    }
+}
+
 #[tauri::command]
 pub async fn api_delete_meeting_with_files<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_id: String,
 ) -> Result<serde_json::Value, String> {
@@ -800,57 +1144,45 @@ pub async fn api_delete_meeting_with_files<R: Runtime>(
     let pool = state.db_manager.pool();
 
     // 1. Look up the meeting's folder_path so we can delete the files too.
-    let folder_path: Option<String> = sqlx::query_scalar(
-        "SELECT folder_path FROM meetings WHERE id = ?",
-    )
-    .bind(&meeting_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| format!("Failed to query meeting folder_path: {}", e))?;
+    let folder_path: Option<String> =
+        sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+            .bind(&meeting_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("Failed to query meeting folder_path: {}", e))?;
 
-    // 2. Delete the database record (meeting + transcripts via cascade).
+    // Move files out of the live recordings tree before committing the DB
+    // deletion. A DB failure restores the folder to its original path.
+    let quarantined = match folder_path.as_deref() {
+        Some(folder) => quarantine_meeting_folder(&app, &meeting_id, folder).await?,
+        None => None,
+    };
+
     match MeetingsRepository::delete_meeting(pool, &meeting_id).await {
         Ok(true) => {
             log_info!("Successfully deleted meeting {}", meeting_id);
         }
         Ok(false) => {
+            if let Some(folder) = quarantined.as_ref() {
+                restore_quarantined_folders(std::slice::from_ref(folder));
+            }
             return Err(format!(
                 "Meeting not found or could not be deleted: {}",
                 meeting_id
-            ))
+            ));
         }
         Err(e) => {
+            if let Some(folder) = quarantined.as_ref() {
+                restore_quarantined_folders(std::slice::from_ref(folder));
+            }
             return Err(format!("Failed to delete meeting: {}", e));
         }
     }
 
-    // 3. Delete the on-disk folder (audio files + transcripts.json) if present.
-    let mut deleted_folder = false;
-    if let Some(folder) = folder_path {
-        if !folder.trim().is_empty() {
-            let path = std::path::Path::new(&folder);
-            if path.exists() {
-                // Safety: only delete directories. Never follow symlinks.
-                if path.is_symlink() {
-                    log_warn!("Refusing to delete symlink: {}", folder);
-                } else if path.is_dir() {
-                    match std::fs::remove_dir_all(&path) {
-                        Ok(_) => {
-                            deleted_folder = true;
-                            log_info!("Deleted meeting folder: {}", folder);
-                        }
-                        Err(e) => {
-                            log_error!("Failed to delete meeting folder {}: {}", folder, e);
-                            return Err(format!(
-                                "Meeting deleted from database but failed to delete folder {}: {}",
-                                folder, e
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let deleted_folder = quarantined
+        .as_ref()
+        .map(|folder| remove_quarantined_folders(std::slice::from_ref(folder)) == 1)
+        .unwrap_or(false);
 
     Ok(serde_json::json!({
         "status": "success",
@@ -861,7 +1193,7 @@ pub async fn api_delete_meeting_with_files<R: Runtime>(
 
 #[tauri::command]
 pub async fn api_delete_meetings<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_ids: Vec<String>,
     delete_files: bool,
@@ -875,65 +1207,43 @@ pub async fn api_delete_meetings<R: Runtime>(
     let pool = state.db_manager.pool();
 
     // Collect folder_paths for all meetings first (so we can delete files).
-    let mut folders_to_delete: Vec<String> = Vec::new();
+    let mut folders_to_delete: Vec<(String, String)> = Vec::new();
     if delete_files {
         for id in &meeting_ids {
-            let folder_path: Option<String> = sqlx::query_scalar(
-                "SELECT folder_path FROM meetings WHERE id = ?",
-            )
-            .bind(id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| format!("Failed to query meeting folder_path: {}", e))?;
+            let folder_path: Option<String> =
+                sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| format!("Failed to query meeting folder_path: {}", e))?;
             if let Some(f) = folder_path {
                 if !f.trim().is_empty() {
-                    folders_to_delete.push(f);
+                    folders_to_delete.push((id.clone(), f));
                 }
             }
         }
     }
 
-    // Delete each meeting from the database.
-    let mut deleted = 0usize;
-    for id in &meeting_ids {
-        match MeetingsRepository::delete_meeting(pool, id).await {
-            Ok(true) => {
-                deleted += 1;
-            }
-            Ok(false) => {
-                log_warn!("Meeting not found or already deleted: {}", id);
-            }
-            Err(e) => {
-                log_error!("Error deleting meeting {}: {}", id, e);
-                return Err(format!("Failed to delete meeting {}: {}", id, e));
+    let mut quarantined = Vec::new();
+    for (meeting_id, folder) in &folders_to_delete {
+        match quarantine_meeting_folder(&app, meeting_id, folder).await {
+            Ok(Some(item)) => quarantined.push(item),
+            Ok(None) => {}
+            Err(error) => {
+                restore_quarantined_folders(&quarantined);
+                return Err(error);
             }
         }
     }
 
-    // Delete the on-disk folders (audio + transcripts.json) if requested.
-    let mut deleted_folders = 0usize;
-    for folder in &folders_to_delete {
-        let path = std::path::Path::new(folder);
-        if path.exists() {
-            if path.is_symlink() {
-                log_warn!("Refusing to delete symlink: {}", folder);
-            } else if path.is_dir() {
-                match std::fs::remove_dir_all(&path) {
-                    Ok(_) => {
-                        deleted_folders += 1;
-                        log_info!("Deleted meeting folder: {}", folder);
-                    }
-                    Err(e) => {
-                        log_error!("Failed to delete meeting folder {}: {}", folder, e);
-                        return Err(format!(
-                            "Meetings deleted from database but failed to delete folder {}: {}",
-                            folder, e
-                        ));
-                    }
-                }
-            }
+    let deleted = match MeetingsRepository::delete_meetings(pool, &meeting_ids).await {
+        Ok(count) => count,
+        Err(error) => {
+            restore_quarantined_folders(&quarantined);
+            return Err(format!("Failed to delete meetings: {error}"));
         }
-    }
+    };
+    let deleted_folders = remove_quarantined_folders(&quarantined);
 
     Ok(serde_json::json!({
         "status": "success",
@@ -977,7 +1287,7 @@ pub async fn api_get_meeting<R: Runtime>(
 /// Get meeting metadata without transcripts (for pagination)
 #[tauri::command]
 pub async fn api_get_meeting_metadata<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     meeting_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<MeetingMetadata, String> {
@@ -991,11 +1301,25 @@ pub async fn api_get_meeting_metadata<R: Runtime>(
     match MeetingsRepository::get_meeting_metadata(pool, &meeting_id).await {
         Ok(Some(meeting)) => {
             log_info!("Successfully retrieved meeting metadata {}", meeting_id);
+            let audio_path = meeting
+                .folder_path
+                .as_deref()
+                .map(std::path::Path::new)
+                .and_then(|folder| audio_paths_in_folder(folder).into_iter().next());
+            if let Some(path) = &audio_path {
+                // Grant the asset protocol access to this one verified meeting
+                // audio file only. The rest of the user's home directory remains
+                // outside the webview's media scope.
+                app.asset_protocol_scope()
+                    .allow_file(path)
+                    .map_err(|error| format!("Failed to allow meeting audio playback: {error}"))?;
+            }
             Ok(MeetingMetadata {
                 id: meeting.id,
                 title: meeting.title,
                 created_at: meeting.created_at.0.to_rfc3339(),
                 updated_at: meeting.updated_at.0.to_rfc3339(),
+                audio_path: audio_path.map(|path| path.to_string_lossy().into_owned()),
                 folder_path: meeting.folder_path,
             })
         }
@@ -1211,7 +1535,7 @@ pub async fn open_meeting_folder<R: Runtime>(
 
     // Get meeting with folder_path
     let meeting: Option<MeetingModel> = sqlx::query_as(
-        "SELECT id, title, created_at, updated_at, folder_path, is_imported, is_read FROM meetings WHERE id = ?",
+        "SELECT id, title, created_at, updated_at, folder_path, is_imported, is_read, collection_id, is_archived, is_favorite FROM meetings WHERE id = ?",
     )
     .bind(&meeting_id)
     .fetch_optional(pool)
@@ -1344,8 +1668,21 @@ pub async fn debug_backend_connection<R: Runtime>(app: AppHandle<R>) -> Result<S
 pub async fn open_external_url(url: String) -> Result<(), String> {
     use std::process::Command;
 
+    const ALLOWED_PREFIXES: &[&str] = &[
+        "https://github.com/noahchen93/snack-meet/",
+        "https://ollama.com/",
+    ];
+    if !ALLOWED_PREFIXES
+        .iter()
+        .any(|prefix| url.starts_with(prefix))
+    {
+        return Err("This external URL is not allowed by Snack Meet".to_string());
+    }
+
     let result = if cfg!(target_os = "windows") {
-        Command::new("cmd").args(&["/C", "start", &url]).output()
+        Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", &url])
+            .output()
     } else if cfg!(target_os = "macos") {
         Command::new("open").arg(&url).output()
     } else {

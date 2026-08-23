@@ -173,20 +173,6 @@ impl InputDeviceKind {
             }
         }
 
-        // Check for virtual audio devices (treat as wired)
-        const VIRTUAL_DEVICE_PATTERNS: &[&str] =
-            &["blackhole", "vb-audio", "virtual", "loopback", "monitor"];
-
-        for pattern in VIRTUAL_DEVICE_PATTERNS {
-            if name_lower.contains(pattern) {
-                info!(
-                    "🔌 Virtual audio device detected: '{}' (pattern: '{}') - treating as Wired",
-                    device_name, pattern
-                );
-                return Some(InputDeviceKind::Wired);
-            }
-        }
-
         None
     }
 
@@ -533,11 +519,5 @@ mod tests {
         // 21.33ms rounds to 21ms
         assert!(timeout >= Duration::from_millis(20));
         assert!(timeout <= Duration::from_millis(50));
-    }
-
-    #[test]
-    fn test_virtual_device_detection() {
-        let kind = InputDeviceKind::detect("BlackHole 2ch", 0, 0);
-        assert_eq!(kind, InputDeviceKind::Wired);
     }
 }

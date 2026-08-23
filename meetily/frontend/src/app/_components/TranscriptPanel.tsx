@@ -36,6 +36,7 @@ export function TranscriptPanel({
   const { isRecording, isPaused } = useRecordingState();
   const { checkPermissions, isChecking, hasSystemAudio, hasMicrophone } = usePermissionCheck();
   const isLinux = useIsLinux();
+  const liveTranscriptionEnabled = transcriptModelConfig.provider === 'openai';
 
   // Convert transcripts to segments for virtualized view
   const segments = useMemo(() =>
@@ -111,7 +112,7 @@ export function TranscriptPanel({
               isPaused={isPaused}
               isProcessing={isProcessingStop}
               isStopping={isStopping}
-              enableStreaming={isRecording}
+              enableStreaming={isRecording && liveTranscriptionEnabled}
               showConfidence={true}
             />
           </div>

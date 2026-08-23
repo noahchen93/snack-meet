@@ -116,16 +116,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_system_audio_devices() {
-        let devices = list_system_audio_devices_command().await;
-        match devices {
-            Ok(device_list) => {
-                println!("System audio devices: {:?}", device_list);
-                assert!(device_list.len() >= 0); // Should at least not crash
-            }
-            Err(e) => {
-                println!("Error listing devices: {}", e);
-                // This might fail on CI or systems without audio
-            }
+        if let Err(error) = list_system_audio_devices_command().await {
+            // Headless CI and Macs without an output device may legitimately
+            // return an error; reaching this point without panicking is the
+            // behavior this smoke test protects.
+            eprintln!("System audio device enumeration unavailable: {error}");
         }
     }
 

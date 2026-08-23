@@ -461,3 +461,29 @@ pub async fn api_cancel_summary<R: Runtime>(
         }))
     }
 }
+
+/// Returns the global user-defined summary system prompt applied to all meetings.
+#[tauri::command]
+pub async fn api_get_global_summary_prompt(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let pool = state.db_manager.pool();
+    crate::database::repositories::setting::SettingsRepository::get_summary_system_prompt(pool)
+        .await
+        .map(|prompt| prompt.unwrap_or_default())
+        .map_err(|e| format!("Failed to load global summary prompt: {}", e))
+}
+
+/// Saves (or clears) the global user-defined summary system prompt.
+#[tauri::command]
+pub async fn api_set_global_summary_prompt(
+    state: tauri::State<'_, AppState>,
+    prompt: String,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    crate::database::repositories::setting::SettingsRepository::save_summary_system_prompt(
+        pool, &prompt,
+    )
+    .await
+    .map_err(|e| format!("Failed to save global summary prompt: {}", e))
+}

@@ -5,8 +5,16 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { Loader2, CheckCircle2, AlertCircle, X } from 'lucide-react';
 import { toast } from 'sonner';
-import Analytics from '@/lib/analytics';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
+import {
+  forgetDeferredTranscription,
+  takeDeferredTranscription,
+} from '@/lib/deferred-transcription';
+import {
+  applyPinnedSummaryLanguageToMeeting,
+  detectAndCacheSummaryLanguage,
+} from '@/lib/summary-language-preferences';
+import { storageService } from '@/services/storageService';
 
 interface RetranscriptionProgress {
   meeting_id: string;
@@ -87,11 +95,6 @@ export function RetranscriptionOverlayProvider() {
 
       const uComplete = await listen<RetranscriptionResult>('retranscription-complete', async (event) => {
         const r = event.payload;
-        await Analytics.track('enhance_transcript_completed', {
-          success: 'true',
-          duration_seconds: r.duration_seconds.toString(),
-          segments_count: r.segments_count.toString(),
-        });
         setJob({
           meetingId: r.meeting_id,
           stage: 'complete',
@@ -106,6 +109,30 @@ export function RetranscriptionOverlayProvider() {
         window.dispatchEvent(
           new CustomEvent(RETRANSCRIPTION_COMPLETE_EVENT, { detail: { meetingId: r.meeting_id } })
         );
+
+        // A local recording is intentionally transcribed only after capture has
+        // stopped. Complete the language/auto-summary steps that were deferred
+        // along with it once real transcript text is available.
+        const deferredJob = takeDeferredTranscription(r.meeting_id);
+        if (deferredJob) {
+          try {
+            const pinned = await applyPinnedSummaryLanguageToMeeting(r.meeting_id);
+            if (!pinned) {
+              const meeting = await storageService.getMeeting(r.meeting_id);
+              const texts = Array.isArray(meeting.transcripts)
+                ? meeting.transcripts.map((item: { text?: string; transcript?: string }) => item.text || item.transcript || '')
+                : [];
+              await detectAndCacheSummaryLanguage(r.meeting_id, texts);
+            }
+          } catch (error) {
+            console.warn('Failed to set summary language after deferred transcription:', error);
+          }
+
+          if (deferredJob.autoSummarize) {
+            invoke('auto_summarize_meeting_command', { meetingId: r.meeting_id })
+              .catch((error) => console.warn('Deferred auto summary failed:', error));
+          }
+        }
         clearHide();
         hideTimer.current = setTimeout(reset, AUTO_HIDE_MS);
       });
@@ -114,7 +141,7 @@ export function RetranscriptionOverlayProvider() {
 
       const uError = await listen<RetranscriptionError>('retranscription-error', async (event) => {
         const r = event.payload;
-        await Analytics.trackError('enhance_transcript_failed', r.error);
+        forgetDeferredTranscription(r.meeting_id);
         setStatus('error');
         setErrorMsg(r.error);
         toast.error('重新转译失败');

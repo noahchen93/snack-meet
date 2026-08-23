@@ -70,36 +70,75 @@ impl Default for RecordingPreferences {
 pub fn get_default_recordings_folder() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
-        // Windows: %USERPROFILE%\Music\meetily-recordings
+        // Windows: %USERPROFILE%\Music\Snack Meet Recordings
         if let Some(music_dir) = dirs::audio_dir() {
-            music_dir.join("meetily-recordings")
+            music_dir.join("Snack Meet Recordings")
         } else {
             // Fallback to Documents if Music folder is not available
             dirs::document_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
-                .join("meetily-recordings")
+                .join("Snack Meet Recordings")
         }
     }
 
     #[cfg(target_os = "macos")]
     {
-        // macOS: ~/Movies/meetily-recordings
-        if let Some(movies_dir) = dirs::video_dir() {
-            movies_dir.join("meetily-recordings")
-        } else {
-            // Fallback to Documents if Movies folder is not available
-            dirs::document_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("meetily-recordings")
-        }
+        // This installation uses Baidu Sync Disk rooted at ~/Desktop/noah.
+        // Keeping one canonical root prevents the saver, importer and scanner
+        // from splitting records between the sync drive and ~/Movies.
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Desktop")
+            .join("noah")
+            .join("meetly recording")
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        // Linux/Others: ~/Documents/meetily-recordings
+        // Linux/Others: ~/Documents/Snack Meet Recordings
         dirs::document_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("meetily-recordings")
+            .join("Snack Meet Recordings")
+    }
+}
+
+fn normalize_legacy_recordings_folder(path: PathBuf) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let value = path.to_string_lossy();
+        if value.ends_with("/Movies/meetily-recordings")
+            || value.ends_with("/Movies/Snack Meet Recordings")
+            || value.ends_with("/Desktop/noah/meetily-recordings")
+        {
+            return get_default_recordings_folder();
+        }
+    }
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_recordings_folder_is_baidu_sync_root() {
+        let path = get_default_recordings_folder();
+        assert!(path.ends_with("Desktop/noah/meetly recording"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_recording_roots_normalize_to_baidu_sync_folder() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            normalize_legacy_recordings_folder(home.join("Movies/meetily-recordings")),
+            get_default_recordings_folder()
+        );
+        assert_eq!(
+            normalize_legacy_recordings_folder(home.join("Desktop/noah/meetily-recordings")),
+            get_default_recordings_folder()
+        );
     }
 }
 
@@ -137,11 +176,12 @@ pub async fn load_recording_preferences<R: Runtime>(
         match serde_json::from_value::<RecordingPreferences>(value.clone()) {
             Ok(mut p) => {
                 info!("Loaded recording preferences from store");
+                p.save_folder = normalize_legacy_recordings_folder(p.save_folder);
                 // Update macOS backend to current value if needed
                 #[cfg(target_os = "macos")]
                 {
                     let backend = crate::audio::capture::get_current_backend();
-                    p.system_audio_backend = Some(backend.to_string());
+                    p.system_audio_backend = Some(backend.id().to_string());
                 }
                 p
             }
@@ -340,7 +380,10 @@ pub async fn get_available_audio_backends() -> Result<Vec<String>, String> {
     #[cfg(target_os = "macos")]
     {
         let backends = crate::audio::capture::get_available_backends();
-        Ok(backends.iter().map(|b| b.to_string()).collect())
+        Ok(backends
+            .iter()
+            .map(|backend| backend.id().to_string())
+            .collect())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -356,7 +399,7 @@ pub async fn get_current_audio_backend() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
         let backend = crate::audio::capture::get_current_backend();
-        Ok(backend.to_string())
+        Ok(backend.id().to_string())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -438,14 +481,14 @@ pub async fn get_audio_backend_info() -> Result<Vec<BackendInfo>, String> {
 
         let backends = vec![
             BackendInfo {
-                id: AudioCaptureBackend::ScreenCaptureKit.to_string(),
+                id: AudioCaptureBackend::ScreenCaptureKit.id().to_string(),
                 name: AudioCaptureBackend::ScreenCaptureKit.name().to_string(),
                 description: AudioCaptureBackend::ScreenCaptureKit
                     .description()
                     .to_string(),
             },
             BackendInfo {
-                id: AudioCaptureBackend::CoreAudio.to_string(),
+                id: AudioCaptureBackend::CoreAudio.id().to_string(),
                 name: AudioCaptureBackend::CoreAudio.name().to_string(),
                 description: AudioCaptureBackend::CoreAudio.description().to_string(),
             },

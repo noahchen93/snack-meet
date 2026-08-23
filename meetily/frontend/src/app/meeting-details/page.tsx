@@ -4,7 +4,6 @@ import { useState, useEffect, useCallback, Suspense } from "react";
 import { Transcript, Summary } from "@/types";
 import PageContent from "./page-content";
 import { useRouter, useSearchParams } from "next/navigation";
-import Analytics from "@/lib/analytics";
 import { invoke } from "@tauri-apps/api/core";
 import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
@@ -17,6 +16,7 @@ interface MeetingDetailsResponse {
   updated_at: string;
   transcripts: Transcript[];
   folder_path?: string;
+  audio_path?: string;
 }
 
 function MeetingDetailsContent() {
@@ -134,6 +134,7 @@ function MeetingDetailsContent() {
         updated_at: metadata.updated_at,
         transcripts: transcripts, // Paginated transcripts from hook
         folder_path: metadata.folder_path, // For retranscription feature
+        audio_path: metadata.audio_path,
       });
 
       // Sync with sidebar context
@@ -201,7 +202,6 @@ function MeetingDetailsContent() {
       console.warn('No valid meeting ID in URL - meetingId:', meetingId);
       setError("No meeting selected");
       setIsLoading(false);
-      Analytics.trackPageView('meeting_details');
       return;
     }
 

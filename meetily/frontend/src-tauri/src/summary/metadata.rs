@@ -61,6 +61,27 @@ fn write_language_field_to_metadata(
     field: &str,
     summary_language: Option<&str>,
 ) -> Result<()> {
+    let value = match summary_language {
+        Some(code) => Some(Value::String(normalise_supported_summary_language(code)?)),
+        None => None,
+    };
+    update_metadata_fields(folder, &[(field, value)])
+}
+
+pub(crate) fn read_metadata_json(folder: &Path) -> Result<Value> {
+    let path = metadata_path(folder);
+    if !path.exists() {
+        return Ok(Value::Object(serde_json::Map::new()));
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    parse_metadata_json(&raw)
+}
+
+pub(crate) fn update_metadata_fields(
+    folder: &Path,
+    fields: &[(&str, Option<Value>)],
+) -> Result<()> {
     let _guard = METADATA_WRITE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -82,13 +103,14 @@ fn write_language_field_to_metadata(
     let object = value
         .as_object_mut()
         .expect("metadata value checked as object");
-    match summary_language {
-        Some(code) => {
-            let normalised = normalise_supported_summary_language(code)?;
-            object.insert(field.to_string(), Value::String(normalised));
-        }
-        None => {
-            object.remove(field);
+    for (field, field_value) in fields {
+        match field_value {
+            Some(value) => {
+                object.insert((*field).to_string(), value.clone());
+            }
+            None => {
+                object.remove(*field);
+            }
         }
     }
 

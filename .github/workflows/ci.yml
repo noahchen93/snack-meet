@@ -1,0 +1,67 @@
+name: Snack Meet CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, codex/snack-meet-stability]
+
+concurrency:
+  group: snack-meet-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: meetily/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: meetily/frontend/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: TypeScript
+        run: pnpm exec tsc --noEmit --incremental false
+      - name: ESLint
+        run: pnpm lint
+      - name: Production frontend build
+        run: pnpm build
+
+  rust-macos:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: meetily
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: meetily -> target
+      - name: Prepare required build sidecars
+        shell: bash
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+          echo "SNACK_MEET_FFMPEG_BINARY=$(command -v ffmpeg)" >> "$GITHUB_ENV"
+          ffmpeg -version | head -n 1
+          host_target="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo build -p llama-helper
+          mkdir -p frontend/src-tauri/binaries
+          install -m 755 target/debug/llama-helper \
+            "frontend/src-tauri/binaries/llama-helper-${host_target}"
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Compile and lint
+        run: cargo clippy --workspace --all-targets
+      - name: Unit tests
+        run: cargo test --workspace

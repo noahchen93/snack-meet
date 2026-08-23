@@ -150,6 +150,23 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         });
         unsubscribers.push(unlistenStarted);
 
+        // Capture stopped is intentionally earlier than recording-stopped.
+        // Release the public recording UI immediately; queued transcription and
+        // persistence continue under PROCESSING_TRANSCRIPTS in the background.
+        const unlistenCaptureStopped = await recordingService.onRecordingCaptureStopped(() => {
+          console.log('[RecordingStateContext] Audio capture stopped; finalizing in background');
+          setState(prev => ({
+            ...prev,
+            isRecording: false,
+            isPaused: false,
+            isActive: false,
+            status: RecordingStatus.PROCESSING_TRANSCRIPTS,
+            statusMessage: 'Recording stopped. Finalizing transcript in background...',
+          }));
+          stopPolling();
+        });
+        unsubscribers.push(unlistenCaptureStopped);
+
         // Recording stopped
         const unlistenStopped = await recordingService.onRecordingStopped((payload) => {
           console.log('[RecordingStateContext] Recording stopped event:', payload);

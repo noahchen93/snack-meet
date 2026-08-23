@@ -3,7 +3,6 @@ import { Switch } from '@/components/ui/switch';
 import { FolderOpen, RefreshCw } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { DeviceSelection, SelectedDevices } from '@/components/DeviceSelection';
-import Analytics from '@/lib/analytics';
 import { toast } from 'sonner';
 
 export interface RecordingPreferences {
@@ -96,11 +95,6 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     const newPreferences = { ...preferences, auto_save: enabled };
     setPreferences(newPreferences);
     await savePreferences(newPreferences);
-
-    // Track auto-save setting change
-    await Analytics.track('auto_save_recording_toggled', {
-      enabled: enabled.toString()
-    });
   };
 
   // Snack Meet: toggle the meeting-window auto-detector. Persisting the pref also
@@ -121,7 +115,6 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
           toast.warning('需要屏幕录制权限', {
             description: '自动检测设置已保存。请在 系统设置 → 隐私与安全 → 屏幕录制 中授权 Snack Meet，然后重启应用。',
           });
-          await Analytics.track('auto_detect_meetings_toggled', { enabled: 'true' });
           return;
         }
         await invoke('meeting_detector_start');
@@ -132,7 +125,6 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
         await invoke('meeting_detector_stop');
         toast.success('已关闭会议自动检测');
       }
-      await Analytics.track('auto_detect_meetings_toggled', { enabled: enabled.toString() });
     } catch (e) {
       // Revert on failure.
       setPreferences(preferences);
@@ -148,13 +140,6 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     };
     setPreferences(newPreferences);
     await savePreferences(newPreferences);
-
-    // Track default device preference changes
-    // Note: Individual device selection analytics are tracked in DeviceSelection component
-    await Analytics.track('default_devices_changed', {
-      has_preferred_microphone: (!!devices.micDevice).toString(),
-      has_preferred_system_audio: (!!devices.systemDevice).toString()
-    });
   };
 
   const handleOpenFolder = async () => {
@@ -223,11 +208,6 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
           description: `扫描 ${result.scanned} 个文件夹，跳过 ${result.skipped} 个，失败 ${result.failed} 个。`,
         });
       }
-      await Analytics.track('scan_import_transcripts', {
-        scanned: result.scanned.toString(),
-        imported: result.imported.toString(),
-        failed: result.failed.toString(),
-      });
     } catch (error) {
       console.error('Failed to scan and import transcripts:', error);
       toast.error('扫描导入失败', {
@@ -246,9 +226,6 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
       await store.set('show_recording_notification', enabled);
       await store.save();
       toast.success('Preference saved');
-      await Analytics.track('recording_notification_preference_changed', {
-        enabled: enabled.toString()
-      });
     } catch (error) {
       console.error('Failed to save notification preference:', error);
       toast.error('Failed to save preference');

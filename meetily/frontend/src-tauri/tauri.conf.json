@@ -1,7 +1,7 @@
 {
     "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
     "productName": "Snack Meet",
-    "version": "0.4.0",
+    "version": "1.0.0",
     "identifier": "com.meetily.ai",
     "build": {
         "frontendDist": "../out",
@@ -36,10 +36,32 @@
                 "decorations": false,
                 "transparent": true,
                 "alwaysOnTop": true,
+                "visibleOnAllWorkspaces": true,
                 "skipTaskbar": true,
                 "visible": false,
                 "focus": false,
                 "shadow": false
+            },
+            {
+                "label": "recording-prompt",
+                "title": "Snack Meet 录音提醒",
+                "url": "recording-prompt.html",
+                "width": 440,
+                "height": 250,
+                "minWidth": 440,
+                "minHeight": 250,
+                "maxWidth": 440,
+                "maxHeight": 250,
+                "resizable": false,
+                "fullscreen": false,
+                "decorations": false,
+                "transparent": true,
+                "alwaysOnTop": true,
+                "visibleOnAllWorkspaces": true,
+                "skipTaskbar": true,
+                "visible": false,
+                "focus": true,
+                "shadow": true
             }
         ],
         "macOSPrivateApi": true,
@@ -48,6 +70,7 @@
                 "default-src": "'self'",
                 "style-src": "'self' 'unsafe-inline'",
                 "img-src": "'self' asset: https://asset.localhost data:",
+                "media-src": "'self' asset: https://asset.localhost blob:",
                 "connect-src": "'self' http://localhost:11434 http://localhost:5167 http://localhost:8178 https://api.ollama.ai"
             },
             "assetProtocol": {
@@ -59,21 +82,9 @@
             "capabilities": [
                 {
                     "identifier": "main",
-                    "description": "Main window capability with file system and media access",
-                    "windows": [
-                        "main",
-                        "recording-overlay"
-                    ],
+                    "description": "Snack Meet main window capability",
+                    "windows": ["main"],
                     "permissions": [
-                        "fs:default",
-                        "fs:allow-read-file",
-                        "fs:read-all",
-                        "fs:write-all",
-                        "fs:allow-app-read",
-                        "fs:allow-app-write",
-                        "fs:allow-download-write",
-                        "fs:allow-download-read",
-                        "fs:scope-download",
                         "core:path:default",
                         "core:event:default",
                         "core:window:default",
@@ -86,6 +97,8 @@
                         "core:window:allow-hide",
                         "core:window:allow-set-position",
                         "core:window:allow-set-focus",
+                        "core:window:allow-set-always-on-top",
+                        "core:window:allow-set-visible-on-all-workspaces",
                         "core:window:allow-unminimize",
                         "core:window:allow-start-dragging",
                         "store:default",
@@ -93,17 +106,39 @@
                         "notification:allow-is-permission-granted",
                         "dialog:allow-confirm",
                         "dialog:allow-save",
-                        "dialog:allow-open",
-                        "updater:default",
-                        "process:default",
-                        {
-                            "identifier": "fs:scope",
-                            "allow": [
-                                {
-                                    "path": "$APPDATA/*"
-                                }
-                            ]
-                        }
+                        "dialog:allow-open"
+                    ]
+                },
+                {
+                    "identifier": "recording-overlay",
+                    "description": "Minimal recording overlay capability",
+                    "windows": ["recording-overlay"],
+                    "permissions": [
+                        "core:path:default",
+                        "core:event:default",
+                        "core:window:default",
+                        "core:window:allow-show",
+                        "core:window:allow-hide",
+                        "core:window:allow-set-position",
+                        "core:window:allow-set-focus",
+                        "core:window:allow-unminimize",
+                        "core:window:allow-start-dragging"
+                    ]
+                },
+                {
+                    "identifier": "recording-prompt",
+                    "description": "Blocking centered meeting recording confirmation",
+                    "windows": ["recording-prompt"],
+                    "permissions": [
+                        "core:event:default",
+                        "core:window:default",
+                        "core:window:allow-show",
+                        "core:window:allow-hide",
+                        "core:window:allow-set-position",
+                        "core:window:allow-set-focus",
+                        "core:window:allow-set-always-on-top",
+                        "core:window:allow-set-visible-on-all-workspaces",
+                        "core:window:allow-start-dragging"
                     ]
                 }
             ]
@@ -119,7 +154,7 @@
             "app",
             "dmg"
         ],
-        "createUpdaterArtifacts": true,
+        "createUpdaterArtifacts": false,
         "icon": [
             "icons/icon.png",
             "icons/app_icon.icns",
@@ -139,14 +174,6 @@
         },
         "windows": {
             "signCommand": "powershell -ExecutionPolicy Bypass -File scripts/sign-windows.ps1 -FilePath %1"
-        }
-    },
-    "plugins": {
-        "updater": {
-            "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVDQTYzMUQ3ODc5N0M4MkEKUldRcXlKZUgxekdtN09DRkVWSHNpZlJseEVOUmpNd1dDSTNaLzZ3MXJGTnY3WW1pdnlOYjBpbkIK",
-            "endpoints": [
-                "https://github.com/Zackriya-Solutions/meeting-minutes/releases/latest/download/latest.json"
-            ]
         }
     }
 }

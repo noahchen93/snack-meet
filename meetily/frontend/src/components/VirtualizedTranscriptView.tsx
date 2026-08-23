@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useRef, useReducer, startTransition, useEffect, useState, memo } from "react";
+import { useRef, useReducer, startTransition, useEffect, memo, useMemo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useAutoScroll } from "@/hooks/useAutoScroll";
 import { useTranscriptStreaming } from "@/hooks/useTranscriptStreaming";
@@ -35,6 +35,18 @@ export interface VirtualizedTranscriptViewProps {
     totalCount?: number;
     loadedCount?: number;
     onLoadMore?: () => void;
+    /** Current meeting-audio position for subtitle synchronization. */
+    playbackTime?: number;
+    /** Auto-follow the active subtitle while audio is playing. */
+    isAudioPlaying?: boolean;
+    /** Seek audio when a transcript timestamp is clicked. */
+    onSeekTo?: (seconds: number) => void;
+    /** Available speaker names for per-segment reassignment. */
+    speakerOptions?: string[];
+    /** Whether to show per-segment speaker dropdowns. */
+    editingSpeakers?: boolean;
+    /** Called when a segment's speaker is reassigned. */
+    onSegmentSpeakerChange?: (segmentId: string, speaker: string) => void;
 }
 
 // Threshold for enabling virtualization (below this, use simple rendering)
@@ -89,6 +101,11 @@ const TranscriptSegment = memo(function TranscriptSegment({
     isStreaming,
     showConfidence,
     speaker,
+    isActive,
+    onSeekTo,
+    speakerOptions,
+    editingSpeakers,
+    onSpeakerChange,
 }: {
     id: string;
     timestamp: number;
@@ -97,17 +114,33 @@ const TranscriptSegment = memo(function TranscriptSegment({
     isStreaming: boolean;
     showConfidence: boolean;
     speaker?: string;
+    isActive?: boolean;
+    onSeekTo?: (seconds: number) => void;
+    speakerOptions?: string[];
+    editingSpeakers?: boolean;
+    onSpeakerChange?: (segmentId: string, speaker: string) => void;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
+    const badge = getSpeakerBadge(speaker);
 
     return (
-        <div id={`segment-${id}`} className="mb-3">
+        <div
+            id={`segment-${id}`}
+            className={`mb-3 rounded-lg border px-2 py-2 transition-colors ${isActive ? 'border-indigo-300 bg-indigo-50 shadow-sm' : 'border-transparent'}`}
+            aria-current={isActive ? 'true' : undefined}
+        >
             <div className="flex items-start gap-2">
                 <Tooltip>
-                    <TooltipTrigger>
-                        <span className="text-xs text-gray-400 mt-1 flex-shrink-0 min-w-[50px]">
+                    <TooltipTrigger asChild>
+                        <button
+                            type="button"
+                            onClick={() => onSeekTo?.(timestamp)}
+                            disabled={!onSeekTo}
+                            className={`text-xs mt-1 flex-shrink-0 min-w-[50px] text-left ${onSeekTo ? 'cursor-pointer hover:text-indigo-700' : ''} ${isActive ? 'font-semibold text-indigo-700' : 'text-gray-400'}`}
+                            title={onSeekTo ? '从这里播放' : undefined}
+                        >
                             {formatRecordingTime(timestamp)}
-                        </span>
+                        </button>
                     </TooltipTrigger>
                     <TooltipContent>
                         {confidence !== undefined && showConfidence && (
@@ -116,12 +149,25 @@ const TranscriptSegment = memo(function TranscriptSegment({
                     </TooltipContent>
                 </Tooltip>
                 <div className="flex-1">
-                    {getSpeakerBadge(speaker) && (
-                        <div className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs border mb-1 ${getSpeakerBadge(speaker)!.color}`}>
-                            {getSpeakerBadge(speaker)!.icon}
-                            <span>{getSpeakerBadge(speaker)!.label}</span>
+                    {editingSpeakers && speakerOptions && speakerOptions.length > 0 ? (
+                        <select
+                            value={speaker || ''}
+                            onChange={(e) => onSpeakerChange?.(id, e.target.value)}
+                            className="mb-1 inline-block max-w-[180px] rounded border border-indigo-200 bg-white px-1.5 py-0.5 text-xs text-indigo-700 focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                            title="重新指定该段说话人"
+                            onClick={(e) => e.stopPropagation()}
+                        >
+                            <option value="" disabled>未指定</option>
+                            {speakerOptions.map((opt) => (
+                                <option key={opt} value={opt}>{opt}</option>
+                            ))}
+                        </select>
+                    ) : badge ? (
+                        <div className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs border mb-1 ${badge.color}`}>
+                            {badge.icon}
+                            <span>{badge.label}</span>
                         </div>
-                    )}
+                    ) : null}
                     {isStreaming ? (
                         <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
@@ -149,11 +195,25 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     totalCount = 0,
     loadedCount = 0,
     onLoadMore,
+    playbackTime,
+    isAudioPlaying = false,
+    onSeekTo,
+    speakerOptions,
+    editingSpeakers = false,
+    onSegmentSpeakerChange,
 }) => {
     // Create scroll ref first - shared between virtualizer and auto-scroll hook
     const scrollRef = useRef<HTMLDivElement>(null);
     // Ref for infinite scroll trigger element
     const loadMoreTriggerRef = useRef<HTMLDivElement>(null);
+    const activeSegmentIndex = useMemo(() => {
+        if (playbackTime === undefined || segments.length === 0) return -1;
+        return segments.findIndex((segment, index) => {
+            const nextStart = segments[index + 1]?.timestamp;
+            const end = segment.endTime ?? nextStart ?? Number.POSITIVE_INFINITY;
+            return playbackTime >= segment.timestamp && playbackTime < end;
+        });
+    }, [segments, playbackTime]);
 
     // Force re-render without flushSync (avoids React warning)
     const [, rerender] = useReducer((x: number) => x + 1, 0);
@@ -170,6 +230,19 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
             });
         },
     });
+
+    // Keep the current subtitle centered while audio is playing. Pausing leaves
+    // the transcript where the user last listened, so manual reading is not
+    // disrupted.
+    useEffect(() => {
+        if (!isAudioPlaying || activeSegmentIndex < 0) return;
+        if (segments.length >= VIRTUALIZATION_THRESHOLD) {
+            virtualizer.scrollToIndex(activeSegmentIndex, { align: 'center' });
+        } else {
+            const active = scrollRef.current?.querySelector(`#segment-${CSS.escape(segments[activeSegmentIndex].id)}`);
+            active?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        }
+    }, [activeSegmentIndex, isAudioPlaying, segments, virtualizer]);
 
     // Custom hook for auto-scrolling (supports both virtualized and non-virtualized)
     useAutoScroll({
@@ -274,15 +347,23 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                 <div className={`w-3 h-3 rounded-full ${isPaused ? 'bg-orange-500' : 'bg-blue-500 animate-pulse'}`}></div>
                             </div>
                             <p className="text-sm text-gray-600">
-                                {isPaused ? 'Recording paused' : 'Listening for speech...'}
+                                {isPaused
+                                    ? 'Recording paused'
+                                    : enableStreaming
+                                        ? 'Listening for speech...'
+                                        : 'Recording audio only'}
                             </p>
                             <p className="text-xs mt-1 text-gray-400">
-                                {isPaused ? 'Click resume to continue recording' : 'Speak to see live transcription'}
+                                {isPaused
+                                    ? 'Click resume to continue recording'
+                                    : enableStreaming
+                                        ? 'Speak to see live transcription'
+                                        : 'Post-recording transcription follows your settings'}
                             </p>
                         </>
                     ) : (
                         <>
-                            <p className="text-lg font-semibold">Welcome to meetily!</p>
+                            <p className="text-lg font-semibold">Welcome to Snack Meet!</p>
                             <p className="text-xs mt-1">Start recording to see live transcription</p>
                         </>
                     )}
@@ -322,6 +403,11 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                         speaker={segment.speaker}
+                                        isActive={virtualRow.index === activeSegmentIndex}
+                                        onSeekTo={onSeekTo}
+                                        speakerOptions={speakerOptions}
+                                        editingSpeakers={editingSpeakers}
+                                        onSpeakerChange={onSegmentSpeakerChange}
                                     />
                                 </div>
                             );
@@ -345,7 +431,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                     )}
 
                     {/* Listening indicator when recording */}
-                    {!isStopping && isRecording && !isPaused && !isProcessing && segments.length > 0 && (
+                    {!isStopping && isRecording && !isPaused && !isProcessing && enableStreaming && segments.length > 0 && (
                         <motion.div
                             initial={{ opacity: 0 }}
                             animate={{ opacity: 1 }}
@@ -379,6 +465,11 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                         speaker={segment.speaker}
+                                        isActive={segments.indexOf(segment) === activeSegmentIndex}
+                                        onSeekTo={onSeekTo}
+                                        speakerOptions={speakerOptions}
+                                        editingSpeakers={editingSpeakers}
+                                        onSpeakerChange={onSegmentSpeakerChange}
                                     />
                                 </motion.div>
                             );

@@ -5,8 +5,8 @@ import { TranscriptModelProps } from '@/components/TranscriptSettings';
 import { SelectedDevices } from '@/components/DeviceSelection';
 import { configService, ModelConfig } from '@/services/configService';
 import { invoke } from '@tauri-apps/api/core';
-import Analytics from '@/lib/analytics';
 import { BetaFeatures, BetaFeatureKey, loadBetaFeatures, saveBetaFeatures } from '@/types/betaFeatures';
+import { readStringMap, writeStringMap } from '@/lib/safe-storage';
 
 export interface OllamaModel {
   name: string;
@@ -256,9 +256,9 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 
                 // Seed per-provider model cache from DB
                 if (resolvedModel) {
-                  const map = JSON.parse(localStorage.getItem('providerModelMap') || '{}');
+                  const map = readStringMap('providerModelMap');
                   map[data.provider] = resolvedModel;
-                  localStorage.setItem('providerModelMap', JSON.stringify(map));
+                  writeStringMap('providerModelMap', map);
                 }
 
                 return; // Early return
@@ -279,9 +279,9 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 
           // Seed per-provider model cache from DB
           if (data.model) {
-            const map = JSON.parse(localStorage.getItem('providerModelMap') || '{}');
+            const map = readStringMap('providerModelMap');
             map[data.provider] = data.model;
-            localStorage.setItem('providerModelMap', JSON.stringify(map));
+            writeStringMap('providerModelMap', map);
           }
         }
       } catch (error) {
@@ -389,17 +389,11 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  // Toggle beta feature with localStorage persistence and analytics
+  // Toggle beta feature with localStorage persistence
   const toggleBetaFeature = useCallback((featureKey: BetaFeatureKey, enabled: boolean) => {
     setBetaFeatures(prev => {
       const updated = { ...prev, [featureKey]: enabled };
       saveBetaFeatures(updated);
-
-      // Track analytics with specific feature
-      Analytics.track('beta_feature_toggled', {
-        feature: featureKey,
-        enabled: enabled.toString(),
-      }).catch(err => console.error('Failed to track beta feature toggle:', err));
 
       return updated;
     });

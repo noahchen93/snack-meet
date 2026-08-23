@@ -5,6 +5,7 @@ use super::constants::AUDIO_EXTENSIONS;
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::vad::get_speech_chunks_with_progress;
 use crate::config::{DEFAULT_PARAKEET_MODEL, DEFAULT_WHISPER_MODEL};
+use crate::database::repositories::setting::SettingsRepository;
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -195,6 +196,75 @@ async fn run_retranscription<R: Runtime>(
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
 
+    // OpenAI Whisper API path: transcribe the whole file in a single request.
+    if provider.as_deref() == Some("openai") {
+        info!(
+            "Starting OpenAI API retranscription for meeting {} (language {:?})",
+            meeting_id, language
+        );
+
+        emit_progress(
+            &app,
+            &meeting_id,
+            "decoding",
+            5,
+            "Connecting to OpenAI Whisper API...",
+        );
+
+        // The automatic post-recording provider is independent from the live
+        // transcription provider, so fetch OpenAI's credential directly rather
+        // than reading the currently selected live provider's config.
+        let app_state = app
+            .try_state::<AppState>()
+            .ok_or_else(|| anyhow!("App state not available"))?;
+        let api_key =
+            SettingsRepository::get_transcript_api_key(app_state.db_manager.pool(), "openai")
+                .await
+                .map_err(|e| anyhow!("Failed to read OpenAI transcription API key: {}", e))?
+                .map(|key| key.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| anyhow!("OpenAI 转写需要 API Key，请先在转写设置中配置。"))?;
+
+        let model_name = model
+            .clone()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "whisper-1".to_string());
+
+        emit_progress(
+            &app,
+            &meeting_id,
+            "transcribing",
+            20,
+            "Transcribing with OpenAI Whisper API...",
+        );
+
+        let transcribed = crate::audio::transcription::openai_provider::transcribe_audio_file(
+            &audio_path,
+            &api_key,
+            &model_name,
+            language.as_deref(),
+        )
+        .await
+        .map_err(|e| anyhow!("OpenAI transcription failed: {}", e))?;
+
+        let all_transcripts: Vec<(String, f64, f64)> = transcribed
+            .segments
+            .into_iter()
+            .map(|s| (s.text, s.start * 1000.0, s.end * 1000.0))
+            .collect();
+
+        return save_retranscription_results(
+            &app,
+            meeting_id,
+            &folder_path,
+            &audio_path,
+            transcribed.duration_secs,
+            all_transcripts,
+            language,
+        )
+        .await;
+    }
+
     // Determine which provider to use (default to whisper)
     let use_parakeet = provider.as_deref() == Some("parakeet");
 
@@ -236,10 +306,26 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("Retranscription cancelled"));
     }
 
-    // Convert to 16kHz mono format (CPU-intensive, run in blocking task)
-    let audio_samples = tokio::task::spawn_blocking(move || decoded.to_whisper_format())
-        .await
-        .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
+    // Convert to 16kHz mono format (CPU-intensive, run in blocking task).
+    // Long recordings are split into minute-sized chunks, so surface progress
+    // from each completed chunk instead of leaving the UI at 15%.
+    let app_for_resample = app.clone();
+    let meeting_id_for_resample = meeting_id.clone();
+    let resample_progress = std::sync::Arc::new(move |progress: u32, message: &str| {
+        let overall_progress = 15 + (progress as f32 * 0.05) as u32;
+        emit_progress(
+            &app_for_resample,
+            &meeting_id_for_resample,
+            "resampling",
+            overall_progress,
+            message,
+        );
+    });
+    let audio_samples = tokio::task::spawn_blocking(move || {
+        decoded.to_whisper_format_with_progress(Some(resample_progress))
+    })
+    .await
+    .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
     info!(
         "Converted to 16kHz mono format: {} samples",
         audio_samples.len()
@@ -483,14 +569,32 @@ async fn run_retranscription<R: Runtime>(
         transcribed_count, processable_count, avg_confidence
     );
 
-    // Check for cancellation
-    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
-        return Err(anyhow!("Retranscription cancelled"));
-    }
+    save_retranscription_results(
+        &app,
+        meeting_id,
+        &folder_path,
+        &audio_path,
+        duration_seconds,
+        all_transcripts,
+        language,
+    )
+    .await
+}
 
-    emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
+/// Shared final step of retranscription: persist segments to the DB and write
+/// transcripts.json / metadata.json, then emit completion.
+async fn save_retranscription_results<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: String,
+    folder_path: &Path,
+    audio_path: &Path,
+    duration_seconds: f64,
+    all_transcripts: Vec<(String, f64, f64)>,
+    language: Option<String>,
+) -> Result<RetranscriptionResult> {
+    emit_progress(app, &meeting_id, "saving", 80, "Saving transcripts...");
 
-    // Create transcript segments with proper timestamps from VAD
+    // Create transcript segments with proper timestamps
     let segments = create_transcript_segments(&all_transcripts);
 
     // Save to database
@@ -544,14 +648,14 @@ async fn run_retranscription<R: Runtime>(
 
     // Write updated transcripts.json and metadata.json to the meeting folder
     emit_progress(
-        &app,
+        app,
         &meeting_id,
         "saving",
         90,
         "Writing transcript files...",
     );
 
-    if let Err(e) = write_transcripts_json(&folder_path, &segments) {
+    if let Err(e) = write_transcripts_json(folder_path, &segments) {
         warn!("Failed to write transcripts.json: {}", e);
     }
 
@@ -563,13 +667,13 @@ async fn run_retranscription<R: Runtime>(
         .to_string();
 
     if let Err(e) =
-        write_retranscription_metadata(&folder_path, &meeting_id, duration_seconds, &audio_filename)
+        write_retranscription_metadata(folder_path, &meeting_id, duration_seconds, &audio_filename)
     {
         warn!("Failed to update metadata.json: {}", e);
     }
 
     emit_progress(
-        &app,
+        app,
         &meeting_id,
         "complete",
         100,

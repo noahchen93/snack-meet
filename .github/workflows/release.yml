@@ -1,0 +1,46 @@
+name: Snack Meet Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: meetily/frontend/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          CONFIG_VERSION="$(node -p "require('./meetily/frontend/src-tauri/tauri.conf.json').version")"
+          test "${GITHUB_REF_NAME}" = "v${CONFIG_VERSION}"
+      - name: Install frontend dependencies
+        working-directory: meetily/frontend
+        run: pnpm install --frozen-lockfile
+      - name: Build complete Snack Meet app
+        run: zsh build.sh
+      - name: Package app bundle
+        run: ditto -c -k --keepParent 'meetily/target/release/bundle/macos/Snack Meet.app' 'Snack-Meet-macOS-arm64.zip'
+      - name: Publish only to this repository
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: gh release create "${GITHUB_REF_NAME}" 'Snack-Meet-macOS-arm64.zip' --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        with:
+          name: Snack-Meet-macOS-arm64
+          path: Snack-Meet-macOS-arm64.zip

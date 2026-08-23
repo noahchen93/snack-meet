@@ -126,14 +126,14 @@ impl Notification {
             }
         };
 
-        Notification::new("Meetily", body, NotificationType::RecordingStarted)
+        Notification::new("Snack Meet", body, NotificationType::RecordingStarted)
             .with_priority(NotificationPriority::High)
             .with_timeout(NotificationTimeout::Seconds(5))
     }
 
     pub fn recording_stopped() -> Self {
         Notification::new(
-            "Meetily",
+            "Snack Meet",
             "Recording has been stopped and saved",
             NotificationType::RecordingStopped,
         )
@@ -143,7 +143,7 @@ impl Notification {
 
     pub fn recording_paused() -> Self {
         Notification::new(
-            "Meetily",
+            "Snack Meet",
             "Recording has been paused",
             NotificationType::RecordingPaused,
         )
@@ -153,7 +153,7 @@ impl Notification {
 
     pub fn recording_resumed() -> Self {
         Notification::new(
-            "Meetily",
+            "Snack Meet",
             "Recording has been resumed",
             NotificationType::RecordingResumed,
         )
@@ -167,7 +167,7 @@ impl Notification {
             None => "Transcription has been completed".to_string(),
         };
 
-        Notification::new("Meetily", body, NotificationType::TranscriptionComplete)
+        Notification::new("Snack Meet", body, NotificationType::TranscriptionComplete)
             .with_priority(NotificationPriority::Normal)
             .with_timeout(NotificationTimeout::Seconds(5))
     }
@@ -179,7 +179,7 @@ impl Notification {
         };
 
         Notification::new(
-            "Meetily",
+            "Snack Meet",
             body,
             NotificationType::MeetingReminder(minutes_until),
         )
@@ -190,7 +190,7 @@ impl Notification {
     pub fn system_error(error: impl Into<String>) -> Self {
         let error_string = error.into();
         Notification::new(
-            "Meetily Error",
+            "Snack Meet Error",
             error_string.clone(),
             NotificationType::SystemError(error_string),
         )
@@ -200,7 +200,7 @@ impl Notification {
 
     pub fn test_notification() -> Self {
         Notification::new(
-            "Meetily",
+            "Snack Meet",
             "This is a test notification to verify the system is working correctly",
             NotificationType::Test,
         )

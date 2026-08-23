@@ -3,35 +3,35 @@
   "description": "Time-boxed daily updates for engineering/product teams.",
   "sections": [
     {
-      "title": "Date",
+      "title": "日期",
       "instruction": "YYYY-MM-DD",
       "format": "string"
     },
     {
-      "title": "Attendees",
+      "title": "参会人员",
       "instruction": "List of participants present",
       "format": "list"
     },
     {
-      "title": "Yesterday",
+      "title": "昨日完成",
       "instruction": "What I completed yesterday (short bullets)",
       "format": "list",
       "example_item_format": "| **Owner** | **Completed Work** |\n| --- | --- |"
     },
     {
-      "title": "Today",
+      "title": "今日计划",
       "instruction": "Planned work for today (short bullets)",
       "format": "list",
       "example_item_format": "| **Owner** | **Planned Work** |\n| --- | --- |"
     },
     {
-      "title": "Blockers",
+      "title": "阻塞问题",
       "instruction": "Any impediments and owner if known",
       "format": "list",
       "item_format": "| **Owner** | **Blocker** | Impact |\n| --- | --- | --- |"
     },
     {
-      "title": "Notes",
+      "title": "备注",
       "instruction": "Optional quick notes or announcements",
       "format": "paragraph"
     }

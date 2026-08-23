@@ -135,7 +135,7 @@ audio/
 // Frontend: src/app/page.tsx
 await invoke('start_recording', {
   mic_device_name: "Built-in Microphone",
-  system_device_name: "BlackHole 2ch",
+  system_device_name: "Built-in Output",
   meeting_name: "Team Standup"
 });
 ```
@@ -326,7 +326,6 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 - **Audio Capture**: Uses ScreenCaptureKit for system audio (macOS 13+)
 - **GPU**: Metal + CoreML automatically enabled
 - **Permissions**: Requires microphone + screen recording permissions
-- **System Audio**: Requires virtual audio device (BlackHole) for system capture
 
 ### Windows
 - **Audio Capture**: Uses WASAPI (Windows Audio Session API)
@@ -366,7 +365,7 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 2. **Platform Audio Quirks**:
    - macOS: ScreenCaptureKit requires macOS 13+, needs screen recording permission
    - Windows: WASAPI exclusive mode can conflict with other apps
-   - System audio requires virtual device (BlackHole on macOS, WASAPI loopback on Windows)
+   - System audio: WASAPI loopback on Windows
 
 3. **Whisper Model Loading**: Models are loaded once and cached. Changing models requires app restart or manual unload/reload.
 

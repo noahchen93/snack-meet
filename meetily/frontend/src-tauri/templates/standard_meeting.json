@@ -3,23 +3,23 @@
   "description": "A standard template for general meetings, focusing on key outcomes and actions.",
   "sections": [
     {
-      "title": "Summary",
+      "title": "摘要",
       "instruction": "Provide a brief, one-paragraph executive summary of the entire meeting.",
       "format": "paragraph"
     },
     {
-      "title": "Key Decisions",
+      "title": "关键决策",
       "instruction": "List the most important decisions made during the meeting.",
       "format": "list"
     },
     {
-      "title": "Action Items",
-      "instruction": "List all assigned tasks with their owners and due date. Always add reference transcript segment and timestamp in the table.",
+      "title": "待办事项",
+      "instruction": "MANDATORY: List every explicit task, follow-up, commitment, owner and deadline. Use a concise bullet list in the form `- Owner — task — due date`. Use `Unassigned` or `No due date` when absent. If none were explicitly assigned, write exactly `No explicit action items were identified.` Do not omit this heading.",
       "format": "list",
-      "item_format": "| **Owner** | Task | Due | Reference Transcript Segment | Segment Time stamp |\n| --- | --- | --- | --- | --- |"
+      "item_format": "- Owner — task — due date"
     },
     {
-      "title": "Discussion Highlights",
+      "title": "讨论要点",
       "instruction": "Summarize the main topics of discussion, key arguments, and important insights.",
       "format": "paragraph"
     }

@@ -53,6 +53,73 @@ fn strip_title_if_present(markdown: &str) -> String {
     }
 }
 
+const KEYWORDS_MARKER_PREFIX: &str = "<!-- KEYWORDS:";
+
+/// Reads the model-selected topic tags from the hidden final-report marker.
+/// The marker is never shown in the summary editor; it only travels alongside
+/// the title in the completed summary result.
+fn extract_summary_keywords(markdown: &str) -> Vec<String> {
+    let Some(contents) = markdown.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let marker_start = trimmed.find(KEYWORDS_MARKER_PREFIX)?;
+        trimmed[marker_start + KEYWORDS_MARKER_PREFIX.len()..]
+            .strip_suffix("-->")
+            .map(str::trim)
+    }) else {
+        return Vec::new();
+    };
+
+    let mut keywords = Vec::new();
+    for keyword in contents
+        .split([',', '，', ';', '；', '|'])
+        .map(str::trim)
+        .filter(|keyword| !keyword.is_empty())
+    {
+        let keyword: String = keyword.chars().take(30).collect();
+        if !keywords.iter().any(|existing| existing == &keyword) {
+            keywords.push(keyword);
+        }
+        if keywords.len() == 5 {
+            break;
+        }
+    }
+    keywords
+}
+
+/// Keywords belong to the final report language. If a translation model omits
+/// the hidden marker, returning canonical English tags would silently violate
+/// the user's explicit language preference. In that case an empty tag list is
+/// safer and will be regenerated on the next summary run.
+fn keywords_for_final_output(
+    final_markdown: &str,
+    english_markdown: &str,
+    summary_language: Option<&str>,
+) -> Vec<String> {
+    let final_keywords = extract_summary_keywords(final_markdown);
+    if !final_keywords.is_empty() {
+        return final_keywords;
+    }
+
+    let translated_target = summary_language
+        .and_then(language_name_from_code)
+        .is_some_and(|language| language != "English");
+    if translated_target {
+        Vec::new()
+    } else {
+        extract_summary_keywords(english_markdown)
+    }
+}
+
+fn strip_keywords_marker(markdown: &str) -> String {
+    markdown
+        .lines()
+        .filter(|line| !line.contains(KEYWORDS_MARKER_PREFIX))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 const ENGLISH_CACHE_FIELD: &str = "english_cache";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,11 +204,13 @@ fn normalise_summary_language_for_cache(summary_language: Option<&str>) -> Optio
 fn build_summary_result_json(
     final_markdown: &str,
     english_markdown: &str,
+    keywords: Vec<String>,
     source: SummaryCacheSource,
     output_language: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
-        "markdown": strip_title_if_present(final_markdown),
+        "markdown": strip_title_if_present(&strip_keywords_marker(final_markdown)),
+        "keywords": keywords,
         ENGLISH_CACHE_FIELD: EnglishSummaryCache {
             markdown: english_markdown.to_string(),
             source,
@@ -182,7 +251,7 @@ fn extract_cached_english_markdown(
     }
 
     let markdown = cache.markdown.trim();
-    if markdown.is_empty() {
+    if markdown.is_empty() || !markdown.contains(KEYWORDS_MARKER_PREFIX) {
         Ok(None)
     } else {
         Ok(Some(cache.markdown))
@@ -389,12 +458,21 @@ impl SummaryService {
         std::fs::rename(&old_path, &new_path)
             .map_err(|e| format!("failed to rename folder to {}: {}", new_folder_name, e))?;
 
-        sqlx::query("UPDATE meetings SET folder_path = ? WHERE id = ?")
+        if let Err(error) = sqlx::query("UPDATE meetings SET folder_path = ? WHERE id = ?")
             .bind(new_path.to_string_lossy().into_owned())
             .bind(meeting_id)
             .execute(pool)
             .await
-            .map_err(|e| format!("failed to update folder_path: {}", e))?;
+        {
+            // Keep filesystem and database paths consistent when the DB write
+            // fails after the filesystem rename.
+            if let Err(rollback_error) = std::fs::rename(&new_path, &old_path) {
+                return Err(format!(
+                    "failed to update folder_path: {error}; filesystem rollback also failed: {rollback_error}"
+                ));
+            }
+            return Err(format!("failed to update folder_path: {error}"));
+        }
 
         info!(
             "Renamed meeting folder '{}' -> '{}' for meeting_id={}",
@@ -525,6 +603,15 @@ impl SummaryService {
             api_key
         };
 
+        // Global user-defined summary system prompt (unified style across all meetings).
+        let global_system_prompt =
+            crate::database::repositories::setting::SettingsRepository::get_summary_system_prompt(
+                &pool,
+            )
+            .await
+            .ok()
+            .flatten();
+
         // Dynamically fetch context size based on provider and model
         let token_threshold = if provider == LLMProvider::Ollama {
             match METADATA_CACHE
@@ -532,11 +619,19 @@ impl SummaryService {
                 .await
             {
                 Ok(metadata) => {
-                    // Reserve 300 tokens for prompt overhead
-                    let optimal = metadata.context_size.saturating_sub(300);
+                    // Base the chunk size on the *runtime* context budget that
+                    // llm_client actually sends to Ollama (num_ctx - output cap),
+                    // so a long transcript can never exceed what the model sees.
+                    let budget = crate::summary::ollama_params::effective_input_budget(
+                        metadata.context_size,
+                    );
+                    let optimal = budget.max(1024);
                     info!(
-                        "✓ Using dynamic context for {}: {} tokens (chunk size: {})",
-                        model_name, metadata.context_size, optimal
+                        "✓ Using runtime context budget for {}: ctx={} input_budget={} (chunk size: {})",
+                        model_name,
+                        crate::summary::ollama_params::effective_num_ctx_for(metadata.context_size),
+                        budget,
+                        optimal
                     );
                     optimal
                 }
@@ -662,6 +757,7 @@ impl SummaryService {
             summary_language.as_deref(),
             detected_summary_language.as_deref(),
             cached_english.as_deref(),
+            global_system_prompt.as_deref(),
         )
         .await;
 
@@ -698,6 +794,11 @@ impl SummaryService {
                 let result_json = build_summary_result_json(
                     &final_markdown,
                     &english_markdown,
+                    keywords_for_final_output(
+                        &final_markdown,
+                        &english_markdown,
+                        summary_language.as_deref(),
+                    ),
                     cache_source,
                     summary_language.as_deref(),
                 );
@@ -911,7 +1012,8 @@ mod tests {
         let source = sample_cache_source();
         let raw = build_summary_result_json(
             "# Reunion\n## Points\nBonjour",
-            "# Meeting\n## Points\nHello",
+            "# Meeting\n## Points\nHello\n<!-- KEYWORDS: Roadmap, API -->",
+            vec![],
             source.clone(),
             Some("fr"),
         )
@@ -919,7 +1021,7 @@ mod tests {
 
         assert_eq!(
             extract_cached_english_markdown(&raw, &source, Some("de")).unwrap(),
-            Some("# Meeting\n## Points\nHello".to_string())
+            Some("# Meeting\n## Points\nHello\n<!-- KEYWORDS: Roadmap, API -->".to_string())
         );
     }
 
@@ -928,7 +1030,8 @@ mod tests {
         let source = sample_cache_source();
         let raw = build_summary_result_json(
             "# Reunion\n## Points\nBonjour",
-            "# Meeting\n## Points\nHello",
+            "# Meeting\n## Points\nHello\n<!-- KEYWORDS: Roadmap, API -->",
+            vec![],
             source.clone(),
             Some("fr"),
         )
@@ -946,7 +1049,8 @@ mod tests {
         let template_fingerprint = source.template_fingerprint.clone();
         let raw = build_summary_result_json(
             "# Reunion\n## Points\nBonjour",
-            "# Meeting\n## Points\nHello",
+            "# Meeting\n## Points\nHello\n<!-- KEYWORDS: Roadmap, API -->",
+            vec![],
             source,
             Some("fr"),
         )
@@ -1066,7 +1170,8 @@ mod tests {
         let source = sample_cache_source();
         let raw = build_summary_result_json(
             "# Reunion\n## Points\nBonjour",
-            "# Meeting\n## Points\nHello",
+            "# Meeting\n## Points\nHello\n<!-- KEYWORDS: Roadmap, API -->",
+            vec![],
             source.clone(),
             Some("fr"),
         )
@@ -1088,7 +1193,8 @@ mod tests {
         let source = sample_cache_source();
         let raw = build_summary_result_json(
             "# Reunion\n## Points\nBonjour",
-            "# Meeting\n## Points\nHello",
+            "# Meeting\n## Points\nHello\n<!-- KEYWORDS: Roadmap, API -->",
+            vec![],
             source.clone(),
             Some("fr"),
         )
@@ -1108,16 +1214,51 @@ mod tests {
     #[test]
     fn test_result_json_strips_display_markdown_but_keeps_cache_title() {
         let result = build_summary_result_json(
-            "# Translated Title\n## Decisions\nDone",
-            "# English Title\n## Decisions\nDone",
+            "# Translated Title\n## Decisions\nDone\n<!-- KEYWORDS: Roadmap, API -->",
+            "# English Title\n## Decisions\nDone\n<!-- KEYWORDS: Roadmap, API -->",
+            vec!["Roadmap".to_string(), "API".to_string()],
             sample_cache_source(),
             Some("fr"),
         );
 
         assert_eq!(result["markdown"], "## Decisions\nDone");
+        assert_eq!(result["keywords"], serde_json::json!(["Roadmap", "API"]));
         assert_eq!(
             result["english_cache"]["markdown"],
-            "# English Title\n## Decisions\nDone"
+            "# English Title\n## Decisions\nDone\n<!-- KEYWORDS: Roadmap, API -->"
+        );
+    }
+
+    #[test]
+    fn ai_keywords_are_extracted_and_hidden_from_display_markdown() {
+        let markdown =
+            "# 产品路线讨论\n\n**摘要**\n内容\n\n<!-- KEYWORDS: 产品路线，接口设计，发布计划 -->";
+        assert_eq!(
+            extract_summary_keywords(markdown),
+            vec!["产品路线", "接口设计", "发布计划"]
+        );
+        assert!(!strip_keywords_marker(markdown).contains("KEYWORDS"));
+    }
+
+    #[test]
+    fn translated_summary_never_falls_back_to_english_keywords() {
+        assert!(keywords_for_final_output(
+            "# 产品路线讨论\n## 摘要\n内容",
+            "# Product Roadmap\n## Summary\nBody\n<!-- KEYWORDS: Roadmap, API -->",
+            Some("zh"),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn english_summary_can_recover_keywords_from_canonical_markdown() {
+        assert_eq!(
+            keywords_for_final_output(
+                "# Product Roadmap\n## Summary\nBody",
+                "# Product Roadmap\n## Summary\nBody\n<!-- KEYWORDS: Roadmap, API -->",
+                Some("en"),
+            ),
+            vec!["Roadmap", "API"]
         );
     }
 

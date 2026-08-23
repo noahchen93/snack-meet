@@ -1,97 +1,48 @@
 # Snack Meet
 
-> A single macOS menu-bar app that **auto-detects meetings, captures system + microphone audio, then automatically transcribes, summarizes, and smart-names the meeting** — no button presses, no second app, no copying files around.
+Snack Meet 是独立维护的、本地优先的 macOS 会议工作台：自动感知会议应用的麦克风占用，录制麦克风与系统声音，生成转写、总结、智能标题和关键词，并允许按会议决定是否保留原始音频。
 
-Snack Meet is a **fusion of two open-source engines into one application**:
+## 独立发布原则
 
-| Comes from | Role in Snack Meet |
-|---|---|
-| [meetily](https://github.com/Zackriya-Solutions/meetily) (MIT) — Tauri (Rust + Next.js) | The **whole app**: UI, tray, native system+mic audio capture (Core Audio process tap — no virtual device), ffmpeg mix, VAD, whisper transcription, LLM summary, the meeting DB, and the smart folder-rename. |
-| [Snack Record](https://github.com/hehej0330/snack-record) (MIT) — Objective-C menu-bar app | **Retired as a separate app.** Its meeting-window auto-detection + start/stop confirmation logic was ported into meetily's Rust backend (`meeting_detector.rs`) and surfaced in the UI (`MeetingDetectorProvider`). The original `snack-record/` source is kept for reference/history. |
+- 唯一代码仓库：`https://github.com/noahchen93/snack-meet`
+- 不拉取、不检查、不安装 Meetily 或 Snack Record 的上游更新。
+- 自动更新暂时关闭；版本只从 Snack Meet 自己的 Releases 页面发布。
+- 每次安装替换完整 `Snack Meet.app`，不会向旧 App 注入单个二进制。
+- macOS bundle identifier 暂时保留 `com.meetily.ai`，仅用于迁移既有数据和 TCC 权限；它不代表任何上游关系。
 
-There is **no longer a wav-file handoff and no second process**. One app detects, records, transcribes, summarizes, and names — end to end.
+## 技术结构
 
-```
- meeting app opens ─► meeting_detector (Rust, SCShareableContent poll) emits meeting-detected
-                       │  frontend: native dialog "已检测到会议开启，是否自动录音？"
-                       │  on confirm → start recording (system+mic, Core Audio tap)
-                       ▼
- meeting window gone / app exits ─► meeting-ended  →  stop + save
-                       │  background summarize → rename_meeting_folder
-                       ▼
-                folder: <topic>_<start>--<end>   (real meeting span from metadata.json)
-```
+```text
+meetily/frontend/
+├── src/                 Next.js / React UI
+└── src-tauri/           Rust、录音、检测、数据库与模型运行时
 
-## Build & install
-
-```zsh
-zsh build.sh        # builds meetily/frontend -> meetily/target/release/meetily
-zsh install.sh      # installs the single app -> /Applications/Snack Meet.app
+build.sh                 构建完整 Snack Meet.app
+install.sh               校验、签名并原子替换 /Applications/Snack Meet.app
 ```
 
-`build.sh` runs `pnpm tauri build --no-bundle` (the `--no-bundle` binary embeds the `_next` frontend; a plain `cargo build` does **not**, and yields a blank UI). The binary lands in the **workspace-root** target dir `meetily/target/release/` — not `src-tauri/target/`. Details and prerequisites (Node, pnpm, Rust, full Xcode, ffmpeg) are in **[docs/INTEGRATION.md](docs/INTEGRATION.md)**.
+`meetily/` 是迁移期间保留的源码目录名。实际 Cargo 包、产品名和版本体系均已独立为 Snack Meet。
 
-### Permissions (TCC)
+## 构建与安装
 
-After the first install, grant in System Settings → Privacy & Security:
+需要完整 Xcode、Rust、Node.js、pnpm，以及受信任的本地 ffmpeg。构建过程不会从原上游下载可执行文件。
 
-- **Screen Recording** → Snack Meet — required for meeting-window detection (`SCShareableContent` enumerates on-screen windows).
-- **Microphone** → Snack Meet.
-- **Audio Capture** → Snack Meet — system audio via Core Audio process tap (macOS 14.4+).
-
-Then open **Snack Meet → Settings → Recording** and turn on **Auto-detect Meetings**. (Screen Recording is requested on first enable.)
-
-`install.sh` creates and reuses a local **Snack Meet Local Code Signing** identity by
-default. This keeps the app's designated requirement stable, so the grants above survive
-future local rebuilds. The first migration from the old ad-hoc signature requires one clean
-re-grant. To intentionally use an ad-hoc signature instead, run
-`SNACK_MEET_SIGNING_IDENTITY=- zsh install.sh`.
-
-## How detection works
-
-`meeting_detector.rs` is a faithful port of Snack Record's `MeetingReminderMonitor`. Every 8 s it enumerates windows (`cidre::sc::ShareableContent`) and running apps (`cidre::ns::Workspace`). A window "suggests a meeting" when:
-
-- it is **not** a home/launcher window (per-app home-title list + normalized comparison), and
-- its title contains a meeting keyword (`会议 通话 meeting call conference zoom teams meet 钉钉 webinar`), or
-- it belongs to a **dedicated** meeting app (腾讯会议 / 腾讯会议 / Zoom) and is large enough (`≥800×500`), **ignoring `isOnScreen`** (SCShareableContent reports `isOnScreen=0` mid-meeting for some apps — the 腾讯会议 fix).
-
-In addition to meeting apps, **voice-calling apps (微信 / WhatsApp 语音)** are detected via sustained microphone use: the mic must be held for ~12 s, so hold-to-talk voice *messages* are ignored while live *calls* trigger a recording. There is no in-call window to watch, so these recordings stop automatically when the mic is released.
-
-It emits `meeting-detected` (then self-cools down 10 min) and, while recording, `meeting-ended{app-exit}` (auto-stop) or `meeting-ended{window-gone}` (ask before stopping). The frontend shows **native** confirmation dialogs (visible above a fullscreen meeting) and drives meetily's existing start/stop/save path. Detect-triggered recordings set a flag so the stop flow auto-summarizes (→ smart rename), mirroring the `--import` path.
-
-## Repository layout
-
-```
-snack-meet/
-├── meetily/                          # The single app (Rust + Tauri + Next.js)
-│   ├── frontend/src-tauri/src/
-│   │   ├── meeting_detector.rs        # ported Snack Record detection
-│   │   ├── external_trigger.rs        # --import + auto_summarize_meeting_command
-│   │   ├── summary/service.rs         # rename_meeting_folder (smart name)
-│   │   └── audio/                     # Core Audio capture, recording_saver, prefs
-│   └── frontend/src/
-│       ├── contexts/MeetingDetectorProvider.tsx  # detector ↔ UI + native dialogs
-│       ├── hooks/useRecordingStop.ts             # save flow + auto-summarize hook
-│       └── components/RecordingSettings.tsx      # Auto-detect Meetings toggle
-├── snack-record/                      # RETIRED — kept for reference/history
-├── docs/INTEGRATION.md
-├── build.sh / install.sh              # single-app build + install
-└── README.md
+```bash
+zsh build.sh
+zsh install.sh
 ```
 
-## Smart folder naming
+安装器只保留 `/Applications/Snack Meet.app`，发现旧 `Meetily.app` 或 `Snack Record.app` 时会将其移到废纸篓。旧版本在清空废纸篓前仍可恢复。
 
-`rename_meeting_folder` names a meeting folder `<topic>_<date>_<start>--<end>` using the **real meeting span** from `metadata.json` — `meeting_name` (`Snack Meet-YYYYMMDD-HHMMSS.txt`, local-time recording start) + `duration_seconds` (end = start + duration) — **not** the import/save time. Verified end-to-end: a 10:19–10:21 meeting renamed to `..._2026-08-01_10-19--10-21`.
+## 质量门禁
 
-## Status
+根目录 `.github/workflows/ci.yml` 会在提交和 PR 上运行：
 
-Working and verified on macOS (Apple Silicon):
-- Native system+mic capture (Core Audio tap), transcription, summary, smart rename. ✅
-- Meeting-window detector (Rust port), native start/stop dialogs, auto-summarize on detect-triggered stop, smart rename. ✅ (builds; live-meeting confirmation pending a real call)
-- Single app — no Snack Record process, tray reads "Snack Meet". ✅
+- TypeScript 类型检查
+- ESLint
+- Next.js 生产构建
+- Rust 格式检查、Clippy 和单元测试
 
-The bundle identifier is kept as `com.meetily.ai` (not renamed) so existing DB/recordings/onboarding/TCC carry over. The `.app` is named and displayed as **"Snack Meet"** (`/Applications/Snack Meet.app`); the internal executable is still `meetily`, which is harmless.
+## 许可证与来源
 
-## License & attribution
-
-Both upstream projects are **MIT**; their licenses are preserved in `snack-record/LICENSE` and `meetily/LICENSE.md`. Snack Meet is also MIT. All credit for the two engines to their original contributors — Snack Meet ports the detection logic into meetily and adds the single-app glue.
+Snack Meet 以 MIT License 发布。项目演进过程中采用过 MIT 许可的 Meetily 和 Snack Record 代码；法定署名与许可证全文见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。这些署名不构成运行时依赖或更新关系。

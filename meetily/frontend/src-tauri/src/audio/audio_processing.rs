@@ -568,15 +568,17 @@ pub fn resample(input: &[f32], from_sample_rate: u32, to_sample_rate: u32) -> Re
         (256, SincInterpolationType::Linear, 256)
     } else if ratio <= 0.5 {
         // Large downsampling (e.g., 48kHz → 16kHz, 48kHz → 8kHz)
-        // Needs strong anti-aliasing
+        // Speech transcription still needs anti-aliasing, but 512 taps make
+        // long imported recordings impractically slow. 128 cubic taps retain
+        // a steep low-pass filter while making 30–60 minute recordings usable.
         debug!(
             "Anti-aliased downsampling: {}Hz → {}Hz (ratio: {:.2}x)",
             from_sample_rate, to_sample_rate, ratio
         );
         (
-            512,                          // Longer sinc for anti-aliasing
+            128,                          // Speech-quality anti-aliasing
             SincInterpolationType::Cubic, // Cubic for quality
-            512,
+            128,
         )
     } else {
         // Moderate downsampling (e.g., 48kHz → 24kHz, 48kHz → 32kHz)

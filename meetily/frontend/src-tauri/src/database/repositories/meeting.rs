@@ -47,6 +47,34 @@ impl MeetingsRepository {
         }
     }
 
+    /// Deletes several meetings in one database transaction. Either every
+    /// existing meeting and its related rows are removed, or none are.
+    pub async fn delete_meetings(
+        pool: &SqlitePool,
+        meeting_ids: &[String],
+    ) -> Result<usize, SqlxError> {
+        let mut transaction = pool.begin().await?;
+        let mut deleted = 0usize;
+
+        for meeting_id in meeting_ids {
+            if meeting_id.trim().is_empty() {
+                transaction.rollback().await?;
+                return Err(SqlxError::Protocol("meeting_id cannot be empty".into()));
+            }
+            match delete_meeting_with_transaction(&mut transaction, meeting_id).await {
+                Ok(true) => deleted += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            }
+        }
+
+        transaction.commit().await?;
+        Ok(deleted)
+    }
+
     pub async fn get_meeting(
         pool: &SqlitePool,
         meeting_id: &str,
@@ -62,7 +90,7 @@ impl MeetingsRepository {
 
         // Get meeting details
         let meeting: Option<MeetingModel> = sqlx::query_as(
-            "SELECT id, title, created_at, updated_at, folder_path, is_imported, is_read FROM meetings WHERE id = ?",
+            "SELECT id, title, created_at, updated_at, folder_path, is_imported, is_read, collection_id, is_archived, is_favorite FROM meetings WHERE id = ?",
         )
         .bind(meeting_id)
         .fetch_optional(&mut *transaction)
@@ -122,7 +150,7 @@ impl MeetingsRepository {
         }
 
         let meeting: Option<MeetingModel> = sqlx::query_as(
-            "SELECT id, title, created_at, updated_at, folder_path, is_imported, is_read FROM meetings WHERE id = ?",
+            "SELECT id, title, created_at, updated_at, folder_path, is_imported, is_read, collection_id, is_archived, is_favorite FROM meetings WHERE id = ?",
         )
         .bind(meeting_id)
         .fetch_optional(pool)

@@ -130,11 +130,8 @@ impl WhisperEngine {
             } else {
                 // Production mode fallback (shouldn't reach here, caller should provide path)
                 log::warn!("WhisperEngine: No models directory provided, using fallback path");
-                dirs::data_dir()
-                    .or_else(|| dirs::home_dir())
+                crate::product_paths::data_subdir("models")
                     .ok_or_else(|| anyhow!("Could not find system data directory"))?
-                    .join("Meetily")
-                    .join("models")
             }
         };
 
@@ -289,10 +286,7 @@ impl WhisperEngine {
         self.load_model_internal(model_name, true).await
     }
 
-    async fn load_model_internal(&self,
-        model_name: &str,
-        set_as_current: bool,
-    ) -> Result<()> {
+    async fn load_model_internal(&self, model_name: &str, set_as_current: bool) -> Result<()> {
         let models = self.available_models.read().await;
         let model_info = models
             .get(model_name)
@@ -403,7 +397,12 @@ impl WhisperEngine {
 
     /// Unload a specific model, leaving other loaded models intact.
     pub async fn unload_model_named(&self, model_name: &str) -> bool {
-        let removed = self.loaded_contexts.write().await.remove(model_name).is_some();
+        let removed = self
+            .loaded_contexts
+            .write()
+            .await
+            .remove(model_name)
+            .is_some();
         if removed {
             log::info!("📉Whisper model '{}' unloaded", model_name);
         }
@@ -1253,10 +1252,7 @@ impl WhisperEngine {
 
             // Report progress every 1% or every 2 seconds for better UI responsiveness
             let time_since_last_report = last_report_time.elapsed().as_secs();
-            if progress >= last_progress_report + 1
-                || progress == 100
-                || time_since_last_report >= 2
-            {
+            if progress > last_progress_report || progress == 100 || time_since_last_report >= 2 {
                 log::info!(
                     "Download progress: {}% ({:.1} MB / {:.1} MB)",
                     progress,

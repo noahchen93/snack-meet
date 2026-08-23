@@ -1,11 +1,9 @@
 'use client'
 
 import './globals.css'
-import { Source_Sans_3 } from 'next/font/google'
 import Sidebar from '@/components/Sidebar'
 import { SidebarProvider } from '@/components/Sidebar/SidebarProvider'
 import MainContent from '@/components/MainContent'
-import AnalyticsProvider from '@/components/AnalyticsProvider'
 import { Toaster, toast } from 'sonner'
 import "sonner/dist/styles.css"
 import { useState, useEffect, useCallback } from 'react'
@@ -20,49 +18,33 @@ import { OnboardingProvider } from '@/contexts/OnboardingContext'
 import { OnboardingFlow } from '@/components/onboarding'
 import { loadBetaFeatures } from '@/types/betaFeatures'
 import { DownloadProgressToastProvider } from '@/components/shared/DownloadProgressToast'
-import { UpdateCheckProvider } from '@/components/UpdateCheckProvider'
 import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcessingProvider'
 import { MeetingDetectorProvider } from '@/contexts/MeetingDetectorProvider'
-import { ImportAudioDialog, ImportDropOverlay } from '@/components/ImportAudio'
+import { ImportDropOverlay } from '@/components/ImportAudio'
+import { BatchImportAudioDialog } from '@/components/ImportAudio/BatchImportAudioDialog'
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
 import { RecordingOverlayController } from '@/components/RecordingOverlayController'
 import { RetranscriptionOverlayProvider } from '@/components/RetranscriptionOverlayProvider'
 import { usePathname } from 'next/navigation'
+import { LocaleProvider } from '@/contexts/LocaleContext'
 
-
-const sourceSans3 = Source_Sans_3({
-  subsets: ['latin'],
-  weight: ['400', '500', '600', '700'],
-  variable: '--font-source-sans-3',
-})
 
 // Module-level component — stable reference across RootLayout re-renders.
 // Defined here (not inside RootLayout) so React never sees a new function type
 // on re-render, which would cause unmount/remount and break initialization logic.
 function ConditionalImportDialog({
-  showImportDialog,
-  handleImportDialogClose,
-  importFilePath,
+  open,
+  onOpenChange,
+  preselectedFiles,
 }: {
-  showImportDialog: boolean;
-  handleImportDialogClose: (open: boolean) => void;
-  importFilePath: string | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  preselectedFiles: string[];
 }) {
   const { betaFeatures } = useConfig();
-
-  // Only mount ImportAudioDialog (and its hooks/listeners) when feature is enabled
-  if (!betaFeatures.importAndRetranscribe) {
-    return null;
-  }
-
-  return (
-    <ImportAudioDialog
-      open={showImportDialog}
-      onOpenChange={handleImportDialogClose}
-      preselectedFile={importFilePath}
-    />
-  );
+  if (!betaFeatures.importAndRetranscribe) return null;
+  return <BatchImportAudioDialog open={open} onOpenChange={onOpenChange} preselectedFiles={preselectedFiles} />;
 }
 
 // export { metadata } from './metadata'
@@ -70,11 +52,12 @@ function ConditionalImportDialog({
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
   const isRecordingOverlay = pathname.includes('recording-overlay')
+  const isRecordingPrompt = pathname.includes('recording-prompt')
 
-  if (isRecordingOverlay) {
+  if (isRecordingOverlay || isRecordingPrompt) {
     return (
       <html lang="zh-CN">
-        <body className={`${sourceSans3.variable} bg-transparent font-sans antialiased`}>
+        <body className="bg-transparent font-sans antialiased">
           {children}
         </body>
       </html>
@@ -90,12 +73,12 @@ function MainRootLayout({
   children: React.ReactNode
 }) {
   const [showOnboarding, setShowOnboarding] = useState(false)
-  const [onboardingCompleted, setOnboardingCompleted] = useState(false)
+  const [, setOnboardingCompleted] = useState(false)
 
   // Import audio state
   const [showDropOverlay, setShowDropOverlay] = useState(false)
   const [showImportDialog, setShowImportDialog] = useState(false)
-  const [importFilePath, setImportFilePath] = useState<string | null>(null)
+  const [importFilePaths, setImportFilePaths] = useState<string[]>([])
 
   useEffect(() => {
     // Check onboarding status first
@@ -155,20 +138,19 @@ function MainRootLayout({
 
     if (!betaFeatures.importAndRetranscribe) {
       toast.error('Beta feature disabled', {
-        description: 'Enable "Import Audio & Retranscribe" in Settings > Beta to use this feature.'
+        description: 'Enable "Import Audio" in Settings > Beta to use this feature.'
       });
       return;
     }
 
-    // Find the first audio file
-    const audioFile = paths.find(p => {
+    const audioFiles = paths.filter(p => {
       const ext = p.split('.').pop()?.toLowerCase();
       return !!ext && isAudioExtension(ext);
     });
 
-    if (audioFile) {
-      console.log('[Layout] Audio file dropped:', audioFile);
-      setImportFilePath(audioFile);
+    if (audioFiles.length > 0) {
+      console.log('[Layout] Audio files dropped:', audioFiles.length);
+      setImportFilePaths(audioFiles);
       setShowImportDialog(true);
     } else if (paths.length > 0) {
       toast.error('Please drop an audio file', {
@@ -233,13 +215,13 @@ function MainRootLayout({
   const handleImportDialogClose = useCallback((open: boolean) => {
     setShowImportDialog(open);
     if (!open) {
-      setImportFilePath(null);
+      setImportFilePaths([]);
     }
   }, []);
 
   // Handler for ImportDialogProvider - opens import dialog from any child component
   const handleOpenImportDialog = useCallback((filePath?: string | null) => {
-    setImportFilePath(filePath ?? null);
+    setImportFilePaths(filePath ? [filePath] : []);
     setShowImportDialog(true);
   }, []);
 
@@ -253,21 +235,22 @@ function MainRootLayout({
 
   return (
     <html lang="en">
-      <body className={`${sourceSans3.variable} font-sans antialiased`}>
-        <AnalyticsProvider>
-          <RecordingStateProvider>
+      <body className="font-sans antialiased">
+        <RecordingStateProvider>
             <TranscriptProvider>
               <ConfigProvider>
+                <LocaleProvider>
                 <OllamaDownloadProvider>
                   <OnboardingProvider>
-                    <UpdateCheckProvider>
-                      <SidebarProvider>
+                    <SidebarProvider>
                         <TooltipProvider>
                           <RecordingPostProcessingProvider>
                             <MeetingDetectorProvider>
                             <RecordingOverlayController />
                             <RetranscriptionOverlayProvider />
-                            <ImportDialogProvider onOpen={handleOpenImportDialog}>
+                            <ImportDialogProvider
+                              onOpen={handleOpenImportDialog}
+                            >
                               {/* Download progress toast provider - listens for background downloads */}
                               <DownloadProgressToastProvider />
 
@@ -283,23 +266,22 @@ function MainRootLayout({
                               {/* Import audio overlay and dialog */}
                               <ImportDropOverlay visible={showDropOverlay} />
                               <ConditionalImportDialog
-                                showImportDialog={showImportDialog}
-                                handleImportDialogClose={handleImportDialogClose}
-                                importFilePath={importFilePath}
+                                open={showImportDialog}
+                                onOpenChange={handleImportDialogClose}
+                                preselectedFiles={importFilePaths}
                               />
                             </ImportDialogProvider>
                             </MeetingDetectorProvider>
                           </RecordingPostProcessingProvider>
                         </TooltipProvider>
-                      </SidebarProvider>
-                    </UpdateCheckProvider>
+                    </SidebarProvider>
                   </OnboardingProvider>
 
                 </OllamaDownloadProvider>
+                </LocaleProvider>
               </ConfigProvider>
             </TranscriptProvider>
           </RecordingStateProvider>
-        </AnalyticsProvider>
 
         <Toaster position="bottom-center" richColors closeButton />
       </body>
