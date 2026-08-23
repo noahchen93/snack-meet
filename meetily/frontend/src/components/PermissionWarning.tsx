@@ -123,9 +123,7 @@ export function PermissionWarning({
                   <div className="space-y-2 text-sm mb-4">
                     <p className="font-medium">To enable system audio on macOS:</p>
                     <ul className="list-disc list-inside ml-2 space-y-1">
-                      <li>Install a virtual audio device (e.g., BlackHole 2ch)</li>
                       <li>Grant Screen Recording permission to Snack Meet</li>
-                      <li>Configure your audio routing in Audio MIDI Setup</li>
                     </ul>
                   </div>
                 )}
