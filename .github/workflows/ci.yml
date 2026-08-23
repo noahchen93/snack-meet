@@ -46,6 +46,14 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: meetily -> target
+      - name: Prepare verified FFmpeg sidecar
+        shell: bash
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+          echo "SNACK_MEET_FFMPEG_BINARY=$(command -v ffmpeg)" >> "$GITHUB_ENV"
+          ffmpeg -version | head -n 1
       - name: Format
         run: cargo fmt --all -- --check
       - name: Compile and lint
