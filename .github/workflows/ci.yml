@@ -46,7 +46,7 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: meetily -> target
-      - name: Prepare verified FFmpeg sidecar
+      - name: Prepare required build sidecars
         shell: bash
         run: |
           if ! command -v ffmpeg >/dev/null 2>&1; then
@@ -54,6 +54,11 @@ jobs:
           fi
           echo "SNACK_MEET_FFMPEG_BINARY=$(command -v ffmpeg)" >> "$GITHUB_ENV"
           ffmpeg -version | head -n 1
+          host_target="$(rustc -vV | sed -n 's/^host: //p')"
+          cargo build -p llama-helper
+          mkdir -p frontend/src-tauri/binaries
+          install -m 755 target/debug/llama-helper \
+            "frontend/src-tauri/binaries/llama-helper-${host_target}"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Compile and lint
